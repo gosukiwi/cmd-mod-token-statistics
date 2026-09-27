@@ -1,0 +1,9 @@
+# Command Code's own per-project state — permission settings and auto-managed taste
+# learnings. Not part of the mod, and machine-specific.
+.commandcode/
+
+# Dependencies (the mod itself has none; the test suite needs none either)
+node_modules/
+
+# macOS
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "name": "cmd-mod-token-statistics",
+  "version": "1.0.0",
+  "description": "Command Code mod that meters tokens — input, output, cache hits, tokens/sec — in the footer and a durable log",
+  "type": "module",
+  "license": "MIT",
+  "commandcode": {
+    "mods": ["./token-statistics.ts"]
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  }
+}

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# Uninstall the token-statistics mod for Command Code.
+#
+# Removes the installed mod file. Your accumulated stats are KEPT by default — pass
+# --purge to also delete the state file and the run log.
+#
+# Override the install location with COMMANDCODE_MODS_DIR if you keep mods elsewhere.
+
+set -euo pipefail
+
+MOD_NAME="token-statistics"
+MODS_DIR="${COMMANDCODE_MODS_DIR:-$HOME/.commandcode/mods}"
+TARGET="$MODS_DIR/$MOD_NAME.ts"
+STATE="$HOME/.commandcode/token-statistics.json"
+LOG="$HOME/.commandcode/token-statistics.log.jsonl"
+
+PURGE=false
+case "${1:-}" in
+	--purge) PURGE=true ;;
+	-h | --help)
+		echo "usage: $(basename "$0") [--purge]"
+		echo
+		echo "  (no args)  remove the installed mod, keep your stats"
+		echo "  --purge    also delete $STATE and $LOG"
+		exit 0
+		;;
+	"") ;;
+	*)
+		echo "error: unknown argument '$1' (try --help)" >&2
+		exit 1
+		;;
+esac
+
+if [[ -f "$TARGET" ]]; then
+	rm -f "$TARGET"
+	echo "removed mod   → $TARGET"
+else
+	echo "no mod at     → $TARGET (nothing to do)"
+fi
+
+if [[ "$PURGE" == true ]]; then
+	for file in "$STATE" "$LOG"; do
+		if [[ -f "$file" ]]; then
+			rm -f "$file"
+			echo "removed state → $file"
+		fi
+	done
+else
+	echo "kept state     → $STATE (use --purge to remove it too)"
+fi
+
+# Only remove the mods directory if this mod left it empty; never touch anything else.
+if [[ -d "$MODS_DIR" ]] && [[ -z "$(ls -A "$MODS_DIR")" ]]; then
+	rmdir "$MODS_DIR"
+	echo "removed empty  → $MODS_DIR"
+fi
