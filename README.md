@@ -7,11 +7,20 @@ segment and a durable log that accumulates across sessions and over months.
 ## Install
 
 ```bash
-bin/install
+cmd mods add -g gosukiwi/cmd-mod-token-statistics
 ```
 
-This copies the mod to `~/.commandcode/mods/` (so it loads in every project). Restart Command
-Code, or run `/reload`.
+`-g` installs it user-wide, so it loads in every project — drop it to scope the mod to the
+current project instead. `cmd mods update` refreshes it after a new commit or tag
+(`cmd mods add gosukiwi/cmd-mod-token-statistics@v1` pins a ref).
+
+To try it without installing anything, load the file straight from a checkout:
+
+```bash
+cmd --mod ./token-statistics.ts
+```
+
+Either way, restart Command Code or run `/reload`.
 
 ## What you get
 
@@ -125,8 +134,13 @@ Both are created on first run. Nothing is sent anywhere — the mod makes no net
 ## Uninstall
 
 ```bash
-bin/uninstall           # remove the mod, keep your stats and log
-bin/uninstall --purge   # also delete the state file and the log
+cmd mods remove token-statistics
+```
+
+That removes the mod; your stats are deliberately left alone. Delete them too with:
+
+```bash
+rm ~/.commandcode/token-statistics.json ~/.commandcode/token-statistics.log.jsonl
 ```
 
 ## Tests
