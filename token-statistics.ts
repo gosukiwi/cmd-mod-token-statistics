@@ -307,6 +307,10 @@ export default function (cmd: ModApi): void {
 	let runSubagentRuns = 0;
 	let runSubagentTokens = 0;
 
+	// Whether any request this session wrote to the prompt cache. Session-scoped, like the
+	// sub-agent counters above, and one of the two conditions guarding the cache figure.
+	let sawCacheWrite = false;
+
 	let warnedWriteFailure = false;
 	let cachedConfig: {mtimeMs: number; value: StateFile} | undefined;
 
@@ -463,6 +467,7 @@ export default function (cmd: ModApi): void {
 		subagentTokens = 0;
 		runSubagentRuns = 0;
 		runSubagentTokens = 0;
+		sawCacheWrite = false;
 	}
 
 	// Look up (or open) the ledger entry for a tool call id. A stop or a completion can
@@ -543,6 +548,32 @@ export default function (cmd: ModApi): void {
 		for (const entry of subagentLedger.values()) {
 			if (entry.tokensUsed > 0) commitSubagent(entry);
 		}
+	}
+
+	// The cache figure on the subagents line. A sub-agent's trailer `total_tokens` is the
+	// whole bill for its run and `tokensUsed` is the part the agent itself measured, so the
+	// difference is the prompt the parent had already cached. Summed over the finalized
+	// sub-agents — the very entries the durable per-sub-agent records are written from, so
+	// both numbers stay auditable from the log without new report fields.
+	//
+	// Only shown when the reading holds everywhere: every finalized sub-agent carries a
+	// finite trailer total (a missing one leaves that run unauditable), and no request this
+	// session wrote to the cache (a write means a prompt was billed fresh, so the gap is not
+	// a cache hit). Otherwise the figure is withheld rather than guessed at.
+	function subagentCacheTokens(): number | undefined {
+		if (sawCacheWrite) return undefined;
+		let cached = 0;
+		let documented = 0;
+		for (const entry of subagentLedger.values()) {
+			if (!entry.finalized) continue;
+			const total = entry.trailer?.totalTokens;
+			if (total === undefined || !Number.isFinite(total)) continue;
+			documented += 1;
+			cached += Math.max(0, total - entry.tokensUsed);
+		}
+		// Every counted run must be one whose record carries a total, or the bound is a bound
+		// on an unknown quantity.
+		return documented === subagentRuns ? cached : undefined;
 	}
 
 	function modelTotals(map: Map<string, Totals>, model: string): Totals {
@@ -673,6 +704,7 @@ export default function (cmd: ModApi): void {
 		addTotals(run, parsed);
 		addTotals(modelTotals(runByModel, modelId), parsed);
 		runGenMs += elapsedMs;
+		if (parsed.cacheWrite > 0) sawCacheWrite = true;
 
 		const seconds = elapsedMs / 1000;
 		if (parsed.output > 0 && seconds > 0) {
@@ -788,7 +820,13 @@ export default function (cmd: ModApi): void {
 			),
 		];
 		if (subagentRuns > 0) {
-			lines.push(row('subagents', `${formatTokens(subagentTokens)} tok · ${plural(subagentRuns, 'run')}`));
+			// The cache cluster is all-or-nothing: a `≥` bound is only worth printing when it
+			// is a bound on every run shown.
+			const cached = subagentCacheTokens();
+			const cache = cached === undefined ? '' : `  ⛁ ≥${percent(cached, subagentTokens)}% cached`;
+			lines.push(
+				row('subagents', `${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`),
+			);
 		}
 		return lines.join('\n');
 	}

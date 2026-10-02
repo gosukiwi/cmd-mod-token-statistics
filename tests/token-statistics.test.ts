@@ -897,3 +897,110 @@ test('/token-stats reset clears the lifetime only after confirmation', async (t)
 	assert.deepEqual(readState().byModel, {});
 	assert.match(confirmed.notices.at(-1)!, /reset/i);
 });
+
+// ---------------------------------------------------------------------------
+// Subagent cache figure
+// ---------------------------------------------------------------------------
+
+// The subagents line of /token-stats — the second line, present once a sub-agent counts.
+function subagentLine(fake: FakeMod): string {
+	return report(fake).split('\n')[1] ?? '';
+}
+
+// A sub-agent whose trailer total exceeds what it spent: the difference is the prompt
+// served from cache, and the only way the mod can see it.
+const CACHED_TRAILER = '<usage>total_tokens: 1250000\n turns: 19</usage>';
+
+test('the subagents line shows the cache figure when every trailer total is known', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+
+	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
+});
+
+test('the cache figure is withheld when a finalized sub-agent has no trailer total', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', 'done, nothing to report here');
+
+	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+});
+
+test('one unauditable sub-agent withholds the figure for the whole line', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	// Measured, but with no trailer total: the figure cannot be taken for all of them.
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
+
+	assert.equal(subagentLine(fake), '  subagents 1.5M tok · 2 runs');
+});
+
+test('the cache figure is withheld once a parent request wrote to the cache', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	// A prompt billed as a cache write is not a cache hit, so the figure loses its meaning.
+	modelCall(fake, t, 'm', usage(100, 10, 90, 800), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+
+	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+});
+
+test('a cache write only withholds the figure for the session it happened in', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 800), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+
+	fake.emit('session_start', {sessionId: 's2'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-2', CACHED_TRAILER);
+
+	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
+});
+
+test('the figure sums the per-sub-agent gaps and clamps a shortfall to zero', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	// A trailer total below the measured spend contributes nothing — never a negative.
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
+	finishAgentCallWithResult(fake, 'call-2', '<usage>total_tokens: 400000</usage>');
+
+	// 250k cached of 1.5M spent.
+	assert.equal(subagentLine(fake), '  subagents 1.5M tok  ⛁ ≥17% cached · 2 runs');
+});
