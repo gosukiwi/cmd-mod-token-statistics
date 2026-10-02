@@ -30,16 +30,19 @@ Either way, restart Command Code or run `/reload`.
 ▲ 128k  ▼ 12.3k  ⚡ 41 tok/s  ⛁ 78% cached  ctx 128k/1M (13%)
 ```
 
-**`/token-stats`** for the full breakdown:
+**`/token-stats`** shows the current session, plus a sub-agent line once one has been counted:
 
 ```
-Token statistics · my-app
-  session   ▲ 128k in  ▼ 12.3k out  ⛁ 78% cached  ·  24 requests
-  lifetime  ▲ 4.2M in  ▼ 318k out  ⛁ 81% cached (62k written)  ·  412 runs since 2026-03-04
-  speed     avg 41 tok/s  ·  range 12–78  ·  over 24 requests
-  context   128k / 1M (13%)  ·  claude-sonnet-5
-  models    claude-sonnet-5  ▲ 4.1M ▼ 300k  (390 requests)
-  log       ~/.commandcode/token-statistics.log.jsonl · 412 records
+  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached
+  subagents 4.2k tok  ⛁ ≥25% cached · 1 run
+```
+
+The `subagents` line is omitted until a sub-agent is finalized, and its `⛁ ≥…` cluster is
+withheld unless the reading holds for every run shown (see below). Before the session's first
+model call the command answers with a single line instead:
+
+```
+no requests recorded yet this session
 ```
 
 **A durable log** — `~/.commandcode/token-statistics.log.jsonl`, one JSON line per run plus one
@@ -84,8 +87,7 @@ Settings live in `~/.commandcode/token-statistics.json` alongside the aggregates
   "summary": false,
   "log": true,
   "contextInStatus": true,
-  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0 },
-  "byModel": {}
+  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0 }
 }
 ```
 
@@ -108,8 +110,8 @@ The file is re-read when it changes, so edits land without a reload.
 
 | Command | What it does |
 |---|---|
-| `/token-stats` | Full breakdown — session, lifetime, speed, context, per-model, log path. |
-| `/token-stats reset` | Ask to confirm, then clear the lifetime totals and per-model breakdown. |
+| `/token-stats` | Current session totals, plus a sub-agent line when one has been counted. |
+| `/token-stats reset` | Ask to confirm, then clear the lifetime totals. |
 
 ## How the numbers are counted
 
@@ -120,11 +122,20 @@ The file is re-read when it changes, so edits land without a reload.
 - **Tokens/sec** is output tokens divided by the wall-clock of the model call (bracketed by
   `model_request_start` / `model_request_end`), so it measures generation speed, not tool time.
 - **Lifetime totals** live in a small JSON file; the per-run history lives in the append-only
-  JSONL. Both are global — shared across every project — so `/token-stats` shows your all-time
-  numbers. Each run record keeps its `cwd`, so per-project grouping is possible later.
-- **Sub-agents** are reported for information only (`subagents` / `subagentTokens`), never added
-  to the lifetime totals: a nested run reports its own usage, which may already be included in
-  the parent's.
+  JSONL. Both are global — shared across every project — and accumulate over months, but they no
+  longer surface in `/token-stats`; this README and the files themselves are their documentation.
+  Each run record keeps its `cwd`, so per-project grouping is possible later.
+- **Sub-agents** are reported for information only — `subagentTokens` is their input + output
+  (cache reads/writes included), never folded into the session or `lifetime` totals: a nested run
+  reports its own usage, which may already be included in the parent's. `/token-stats` sums the
+  finalized sub-agents into one `N tok` figure and counts them as `· N runs`. A `⛁ ≥N% cached`
+  cluster is added only when every finalized sub-agent carries a parsed `<usage>` trailer with a
+  known `total_tokens` *and* no request this session wrote to the cache; the `≥` marks a bound —
+  `cached = Σ max(0, total_tokens − tokensUsed)`, so the true hit rate is at least
+  `cached / tokensUsed`. No `⚡` rate appears on the sub-agent line: the harness exposes neither a
+  sub-agent's output tokens nor its generation time. A `subagent_stop` that reports
+  `tokensUsed === 0` never counts, and a background sub-agent counts only when its non-zero stop
+  lands; `subagent_progress` carries an estimate and is never summed.
 - **Fallback.** If a run records no `model_request_end` (an interrupted run, or a provider that
   does not emit one), the run's total is taken from the harness-reported `result.usage`.
 
@@ -132,10 +143,12 @@ The file is re-read when it changes, so edits land without a reload.
 
 | Path | What it is |
 |---|---|
-| `~/.commandcode/token-statistics.json` | Settings + lifetime/per-model aggregates (rewritten per run, atomically). |
+| `~/.commandcode/token-statistics.json` | Settings + lifetime aggregates (rewritten per run, atomically). |
 | `~/.commandcode/token-statistics.log.jsonl` | Append-only, one record per run plus one per sub-agent. Safe to keep, grep, or chart. |
 
-Both are created on first run. Nothing is sent anywhere — the mod makes no network calls.
+Both are created on first run. Their contents no longer surface in `/token-stats` — the lifetime
+aggregates live only here and in the log, so this README and the files themselves document them.
+Nothing is sent anywhere — the mod makes no network calls.
 
 ## Uninstall
 
