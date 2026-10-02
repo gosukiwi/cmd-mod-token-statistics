@@ -80,7 +80,6 @@ interface StateFile {
 	readonly log?: boolean;
 	readonly contextInStatus?: boolean;
 	readonly lifetime?: Partial<Lifetime>;
-	readonly byModel?: Record<string, Partial<Totals>>;
 }
 
 interface Usage {
@@ -279,7 +278,9 @@ export default function (cmd: ModApi): void {
 
 	// Run-scoped state, reset on every run_start.
 	let run = zeros();
-	let runByModel = new Map<string, Totals>();
+	// The model ids seen this run, for the per-run log line. Only the ids are needed — the
+	// per-model totals were dropped along with the report's models row.
+	let runModels = new Set<string>();
 	let runStartedAt: number | undefined;
 	let runGenMs = 0;
 	let reportedRunEnd = false;
@@ -450,7 +451,7 @@ export default function (cmd: ModApi): void {
 		Object.assign(session, zeros());
 		sessionId = undefined;
 		run = zeros();
-		runByModel = new Map();
+		runModels = new Set();
 		runStartedAt = undefined;
 		runGenMs = 0;
 		reportedRunEnd = false;
@@ -576,15 +577,6 @@ export default function (cmd: ModApi): void {
 		return documented === subagentRuns ? cached : undefined;
 	}
 
-	function modelTotals(map: Map<string, Totals>, model: string): Totals {
-		let totals = map.get(model);
-		if (totals === undefined) {
-			totals = zeros();
-			map.set(model, totals);
-		}
-		return totals;
-	}
-
 	// Fold the finished run into the durable aggregates. The per-run log line is written
 	// separately (appendLog), so this only touches the small JSON.
 	function foldLifetime(): void {
@@ -601,19 +593,7 @@ export default function (cmd: ModApi): void {
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
 
-		const byModel: Record<string, Partial<Totals>> = {...(file.byModel ?? {})};
-		for (const [model, totals] of runByModel) {
-			const existing = byModel[model] ?? {};
-			byModel[model] = {
-				input: num(existing.input) + totals.input,
-				output: num(existing.output) + totals.output,
-				cacheRead: num(existing.cacheRead) + totals.cacheRead,
-				cacheWrite: num(existing.cacheWrite) + totals.cacheWrite,
-				requests: num(existing.requests) + totals.requests,
-			};
-		}
-
-		updateConfigFile({lifetime, byModel});
+		updateConfigFile({lifetime});
 	}
 
 	function finalizeRun(result: unknown): void {
@@ -648,7 +628,7 @@ export default function (cmd: ModApi): void {
 			cacheRead: run.cacheRead,
 			cacheWrite: run.cacheWrite,
 			requests: run.requests,
-			models: [...runByModel.keys()],
+			models: [...runModels],
 			durationMs: wallMs,
 			genMs,
 			outputTokPerSec,
@@ -680,7 +660,7 @@ export default function (cmd: ModApi): void {
 
 	cmd.on('run_start', ({sessionId: id} = {}) => {
 		run = zeros();
-		runByModel = new Map();
+		runModels = new Set();
 		runStartedAt = Date.now();
 		runGenMs = 0;
 		runSubagentRuns = 0;
@@ -702,7 +682,7 @@ export default function (cmd: ModApi): void {
 
 		addTotals(session, parsed);
 		addTotals(run, parsed);
-		addTotals(modelTotals(runByModel, modelId), parsed);
+		runModels.add(modelId);
 		runGenMs += elapsedMs;
 		if (parsed.cacheWrite > 0) sawCacheWrite = true;
 
@@ -798,7 +778,7 @@ export default function (cmd: ModApi): void {
 					.then((confirmed) => {
 						if (!confirmed) return;
 						try {
-							updateConfigFile({lifetime: undefined, byModel: {}});
+							updateConfigFile({lifetime: undefined});
 							cmd.ui.notify('token-statistics: lifetime totals reset.');
 						} catch (error) {
 							warn(`token-statistics: could not reset stats (${describeError(error)}).`);

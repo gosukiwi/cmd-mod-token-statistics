@@ -305,7 +305,8 @@ test('a finished run appends a log line and folds into the lifetime totals', asy
 	assert.equal(state.lifetime.input, 20_000);
 	assert.equal(state.lifetime.cacheRead, 12_400);
 	assert.equal(state.lifetime.runs, 1);
-	assert.equal(state.byModel['claude-sonnet-5'].output, 38);
+	// The per-model aggregate is gone: the model ids live only on the per-run log line.
+	assert.equal(state.byModel, undefined);
 });
 
 test('lifetime totals persist across sessions', async (t) => {
@@ -894,7 +895,7 @@ test('/token-stats reset clears the lifetime only after confirmation', async (t)
 	await settle();
 
 	assert.equal(readState().lifetime, undefined);
-	assert.deepEqual(readState().byModel, {});
+	assert.equal(readState().byModel, undefined);
 	assert.match(confirmed.notices.at(-1)!, /reset/i);
 });
 
