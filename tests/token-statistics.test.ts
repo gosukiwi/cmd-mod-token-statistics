@@ -451,7 +451,7 @@ test('sub-agent tokens are shown but never folded into the totals', async (t) =>
 	assert.equal(readState().lifetime.output, 10);
 
 	assert.match(report(fake), /subagents/);
-	assert.match(report(fake), /4\.2k tokens/);
+	assert.match(report(fake), /4\.2k tok · 1 run/);
 });
 
 test('a foreground sub-agent finalizes only when its agent tool call completes', (t) => {
@@ -459,6 +459,7 @@ test('a foreground sub-agent finalizes only when its agent tool call completes',
 	const fake = setup();
 
 	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 
@@ -470,7 +471,7 @@ test('a foreground sub-agent finalizes only when its agent tool call completes',
 
 	finishAgentCall(fake, 'call-1');
 	assert.match(report(fake), /subagents/);
-	assert.match(report(fake), /4\.2k tokens/);
+	assert.match(report(fake), /4\.2k tok · 1 run/);
 });
 
 test('a background sub-agent finalizes on its stop, with no agent tool call', async (t) => {
@@ -483,7 +484,7 @@ test('a background sub-agent finalizes on its stop, with no agent tool call', as
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
 
 	assert.match(report(fake), /subagents/);
-	assert.match(report(fake), /1k tokens/);
+	assert.match(report(fake), /1k tok · 1 run/);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 	const record = runRecords()[0];
@@ -553,7 +554,7 @@ test('finalization is idempotent', async (t) => {
 	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
-	assert.match(report(fake), /1 run · 4\.2k tokens/);
+	assert.match(report(fake), /4\.2k tok · 1 run/);
 });
 
 test('the per-run sub-agent count does not leak into the next run', async (t) => {
@@ -595,11 +596,13 @@ test('a new session starts with no sub-agent activity to report', (t) => {
 	const fake = setup();
 
 	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', background: true});
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', tokensUsed: 4200});
 	assert.match(report(fake), /subagents/);
 
 	fake.emit('session_start', {sessionId: 's2'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
 	assert.doesNotMatch(report(fake), /subagents/);
 });
 
@@ -828,7 +831,7 @@ test('the per-run summary row is printed only when enabled', async (t) => {
 // /token-stats
 // ---------------------------------------------------------------------------
 
-test('/token-stats reports the session, lifetime, models and log path', async (t) => {
+test('/token-stats prints exactly one session line, and no lifetime, models or log rows', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
@@ -837,20 +840,37 @@ test('/token-stats reports the session, lifetime, models and log path', async (t
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	const message = fake.commands.get('token-stats')!().message;
-	assert.match(message, /Token statistics · my-app/);
-	assert.match(message, /session/);
-	assert.match(message, /lifetime/);
-	assert.match(message, /62% cached/);
-	assert.match(message, /claude-sonnet-5/);
-	assert.match(message, /token-statistics\.log\.jsonl/);
-	assert.match(message, /1 record/);
+	// One line, no header, and neither the `(N written)` nor the `· N requests` suffix.
+	assert.equal(message, '  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached');
+});
+
+test('/token-stats adds a subagents line once a sub-agent has been counted', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'claude-sonnet-5', usage(20_000, 38, 12_400, 800), 1000);
+	assert.equal(
+		fake.commands.get('token-stats')!().message.split('\n').length,
+		1,
+		'no subagents line before any sub-agent is counted',
+	);
+
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCall(fake, 'call-1');
+
+	const message = fake.commands.get('token-stats')!().message;
+	assert.equal(
+		message,
+		['  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached', '  subagents 4.2k tok · 1 run'].join('\n'),
+	);
 });
 
 test('/token-stats says so when nothing has been recorded', () => {
 	const fake = setup();
 	const message = fake.commands.get('token-stats')!().message;
-	assert.match(message, /no requests recorded yet this session/);
-	assert.match(message, /nothing recorded yet/);
+	assert.equal(message, 'no requests recorded yet this session');
 });
 
 test('/token-stats reset clears the lifetime only after confirmation', async (t) => {

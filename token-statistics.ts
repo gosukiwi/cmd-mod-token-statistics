@@ -25,7 +25,7 @@
 //
 // Surfaces:
 //   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, context usage
-//   • /token-stats                     — full breakdown: session, lifetime, cache, models
+//   • /token-stats                     — session totals plus sub-agent usage (at most two lines)
 //   • a per-run feed row (opt-in via the "summary" setting)
 //
 // Headless (`cmd -p`) renders no footer and drops feed rows, but the log still writes —
@@ -244,11 +244,6 @@ function humanDuration(ms: number): string {
 	return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`;
 }
 
-function projectName(cwd: string): string {
-	const parts = cwd.split('/').filter(Boolean);
-	return parts.at(-1) ?? cwd;
-}
-
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -409,25 +404,6 @@ export default function (cmd: ModApi): void {
 	function appendLog(record: RunRecord | SubagentRecord): void {
 		mkdirSync(dirname(LOG_PATH), {recursive: true});
 		appendFileSync(LOG_PATH, `${JSON.stringify(record)}\n`);
-	}
-
-	function readLog(): RunRecord[] {
-		let text: string;
-		try {
-			text = readFileSync(LOG_PATH, 'utf8');
-		} catch {
-			return [];
-		}
-		const records: RunRecord[] = [];
-		for (const line of text.split('\n')) {
-			if (line.trim() === '') continue;
-			try {
-				records.push(JSON.parse(line) as RunRecord);
-			} catch {
-				// A torn last line is ignored rather than failing the whole report.
-			}
-		}
-		return records;
 	}
 
 	function averageRate(): number {
@@ -802,81 +778,22 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
+	// At most two lines: the session totals, plus a sub-agent line when one has been counted.
 	function reportText(): string {
-		const file = readConfigFile();
-		const lifetime = file.lifetime;
-		const byModel = file.byModel ?? {};
-		const log = readLog();
-		const lines: string[] = [
-			`Token statistics · ${projectName(cmd.cwd)}`,
-			row('session', sessionLine()),
-			row('lifetime', lifetimeLine(lifetime)),
-			row('speed', speedLine()),
-			row('context', contextLine()),
-			row('models', modelLines(byModel)),
+		if (session.requests === 0) return 'no requests recorded yet this session';
+		const lines = [
+			row(
+				'session',
+				`▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`,
+			),
 		];
 		if (subagentRuns > 0) {
-			lines.push(row('subagents', `${plural(subagentRuns, 'run')} · ${formatTokens(subagentTokens)} tokens`));
+			lines.push(row('subagents', `${formatTokens(subagentTokens)} tok · ${plural(subagentRuns, 'run')}`));
 		}
-		lines.push(row('log', `${LOG_PATH} · ${plural(log.length, 'record')}`));
 		return lines.join('\n');
 	}
 
 	function row(label: string, value: string): string {
 		return `  ${label.padEnd(10)}${value}`;
-	}
-
-	function sessionLine(): string {
-		if (session.requests === 0) return 'no requests recorded yet this session';
-		return `${totalsLine(session)}  ·  ${plural(session.requests, 'request')}`;
-	}
-
-	function lifetimeLine(lifetime: Partial<Lifetime> | undefined): string {
-		if (lifetime === undefined || num(lifetime.requests) === 0) return 'nothing recorded yet';
-		return `${totalsLine(lifetime)}  ·  ${plural(num(lifetime.runs), 'run')} since ${shortDate(lifetime.since)}`;
-	}
-
-	function speedLine(): string {
-		if (rates.count === 0) return 'no timings yet';
-		const base = `avg ${formatRate(averageRate())} tok/s`;
-		if (rates.count === 1) return `${base}  ·  over 1 request`;
-		return `${base}  ·  range ${formatRate(rates.min)}–${formatRate(rates.max)}  ·  over ${plural(rates.count, 'request')}`;
-	}
-
-	function contextLine(): string {
-		if (lastContextTokens === 0) return 'not measured yet';
-		const window = contextWindowFor(lastContextModel);
-		const suffix = lastContextModel === undefined ? '' : `  ·  ${lastContextModel}`;
-		return window === undefined
-			? `${formatTokens(lastContextTokens)} tokens (window unknown)${suffix}`
-			: `${formatTokens(lastContextTokens)} / ${formatTokens(window)} (${percent(lastContextTokens, window)}%)${suffix}`;
-	}
-
-	function modelLines(byModel: Record<string, Partial<Totals>>): string {
-		const entries = Object.entries(byModel)
-			.map(([model, totals]) => ({model, totals}))
-			.filter((entry) => num(entry.totals.requests) > 0)
-			.sort((a, b) => num(b.totals.input) + num(b.totals.output) - (num(a.totals.input) + num(a.totals.output)))
-			.slice(0, 5);
-
-		if (entries.length === 0) return 'nothing recorded yet';
-		return entries
-			.map(
-				({model, totals}) =>
-					`${model}  ▲ ${formatTokens(num(totals.input))} ▼ ${formatTokens(num(totals.output))}  (${plural(num(totals.requests), 'request')})`,
-			)
-			.join('\n            ');
-	}
-
-	function totalsLine(totals: Pick<Totals, 'input' | 'output' | 'cacheRead' | 'cacheWrite'>): string {
-		const cache = `⛁ ${percent(totals.cacheRead, totals.input)}% cached`;
-		const write = totals.cacheWrite > 0 ? ` (${formatTokens(totals.cacheWrite)} written)` : '';
-		return `▲ ${formatTokens(totals.input)} in  ▼ ${formatTokens(totals.output)} out  ${cache}${write}`;
-	}
-
-	function shortDate(value: unknown): string {
-		if (typeof value !== 'string') return 'unknown';
-		const date = new Date(value);
-		return Number.isNaN(date.getTime()) ? 'unknown' : date.toISOString().slice(0, 10);
 	}
 }
