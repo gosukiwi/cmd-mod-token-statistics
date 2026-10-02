@@ -90,6 +90,17 @@ interface Usage {
 	readonly cacheWrite: number;
 }
 
+// One in-flight sub-agent, keyed by the `agent` tool call that launched it. A stop carries
+// the token count, but the entry is only finalizable once the sub-agent is known to be done:
+// a background one is done when it stops, a foreground one when its tool call completes.
+interface SubagentRun {
+	subagentType: string | undefined;
+	background: boolean;
+	agentDone: boolean;
+	tokensUsed: number;
+	finalized: boolean;
+}
+
 interface RunRecord {
 	readonly ts: string;
 	readonly sessionId: string | undefined;
@@ -232,13 +243,18 @@ export default function (cmd: ModApi): void {
 	let lastContextTokens = 0;
 	let lastContextModel: string | undefined;
 
-	// Sub-agent activity is informational — nested runs report their own token totals,
-	// which may or may not already be folded into the parent's usage. Never summed into
-	// the lifetime totals, only shown. Kept both session-wide (for the report) and
-	// run-scoped (for the log line).
-	let subagentCalls = 0;
+	// Sub-agents are informational — nested runs report their own token totals, which may or
+	// may not already be folded into the parent's usage. Never summed into the session or
+	// lifetime totals, only shown.
+	//
+	// The ledger is keyed by tool call id and holds every sub-agent that has started but not
+	// yet been finalized, so that a stop's token count can wait for the sub-agent to actually
+	// be done (see finalizeSubagent). subagentRuns / subagentTokens are session-wide (for the
+	// report); runSubagentRuns / runSubagentTokens are run-scoped (for the log line).
+	let subagentLedger = new Map<string, SubagentRun>();
+	let subagentRuns = 0;
 	let subagentTokens = 0;
-	let runSubagentCalls = 0;
+	let runSubagentRuns = 0;
 	let runSubagentTokens = 0;
 
 	let warnedWriteFailure = false;
@@ -408,10 +424,55 @@ export default function (cmd: ModApi): void {
 		rates.max = 0;
 		lastContextTokens = 0;
 		lastContextModel = undefined;
-		subagentCalls = 0;
+		subagentLedger = new Map();
+		subagentRuns = 0;
 		subagentTokens = 0;
-		runSubagentCalls = 0;
+		runSubagentRuns = 0;
 		runSubagentTokens = 0;
+	}
+
+	// Look up (or open) the ledger entry for a tool call id. A stop or a completion can
+	// arrive without its start; the entry is still harmless — it only ever counts once it
+	// has both a token count and a completion signal.
+	function subagentEntry(toolCallId: string, subagentType?: string): SubagentRun {
+		let entry = subagentLedger.get(toolCallId);
+		if (entry === undefined) {
+			entry = {subagentType, background: false, agentDone: false, tokensUsed: 0, finalized: false};
+			subagentLedger.set(toolCallId, entry);
+		}
+		if (entry.subagentType === undefined && subagentType !== undefined) entry.subagentType = subagentType;
+		return entry;
+	}
+
+	// A sub-agent counts exactly once, and only once its tokens are known AND it is known to
+	// be done: a background one is done when it stops, a foreground one when its `agent` tool
+	// call completes. The `finalized` flag is what makes a second stop — or the run-end sweep
+	// after a normal finalize — a no-op rather than a double count.
+	function finalizeSubagent(entry: SubagentRun): void {
+		if (entry.finalized || entry.tokensUsed <= 0) return;
+		if (!entry.background && !entry.agentDone) return;
+		commitSubagent(entry);
+	}
+
+	// Book the entry into the session and run accumulators. Idempotent: `finalized` latches
+	// on the first call, so every later path is a no-op.
+	function commitSubagent(entry: SubagentRun): void {
+		if (entry.finalized) return;
+		entry.finalized = true;
+		subagentRuns += 1;
+		subagentTokens += entry.tokensUsed;
+		runSubagentRuns += 1;
+		runSubagentTokens += entry.tokensUsed;
+	}
+
+	// The end of a run is the last chance to account for anything still in the ledger — the
+	// run ending is itself a completion signal, so an entry with a token count is booked even
+	// if its stop or completion never arrived (an aborted run, or a host that does not emit
+	// afterToolCall).
+	function sweepSubagents(): void {
+		for (const entry of subagentLedger.values()) {
+			if (entry.tokensUsed > 0) commitSubagent(entry);
+		}
 	}
 
 	function modelTotals(map: Map<string, Totals>, model: string): Totals {
@@ -458,6 +519,9 @@ export default function (cmd: ModApi): void {
 		if (reportedRunEnd) return;
 		reportedRunEnd = true;
 
+		// Anything still in the ledger holding a token count is this run's to report.
+		sweepSubagents();
+
 		const typed = (result ?? {}) as Record<string, unknown>;
 		const stopReason = typeof typed.stopReason === 'string' ? typed.stopReason : 'unknown';
 
@@ -487,7 +551,7 @@ export default function (cmd: ModApi): void {
 			durationMs: wallMs,
 			genMs,
 			outputTokPerSec,
-			subagents: runSubagentCalls,
+			subagents: runSubagentRuns,
 			subagentTokens: runSubagentTokens,
 		};
 
@@ -518,7 +582,7 @@ export default function (cmd: ModApi): void {
 		runByModel = new Map();
 		runStartedAt = Date.now();
 		runGenMs = 0;
-		runSubagentCalls = 0;
+		runSubagentRuns = 0;
 		runSubagentTokens = 0;
 		reportedRunEnd = false;
 		if (typeof id === 'string') sessionId = id;
@@ -557,11 +621,23 @@ export default function (cmd: ModApi): void {
 		refreshStatus();
 	});
 
-	cmd.on('subagent_stop', ({tokensUsed} = {}) => {
-		subagentCalls += 1;
-		subagentTokens += num(tokensUsed);
-		runSubagentCalls += 1;
-		runSubagentTokens += num(tokensUsed);
+	cmd.on('subagent_start', ({toolCallId, subagentType, background} = {}) => {
+		if (typeof toolCallId !== 'string') return;
+		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
+		// A background sub-agent outlives the tool call that launched it, so its stop is
+		// already its completion signal.
+		entry.background = background === true;
+	});
+
+	cmd.on('subagent_stop', ({toolCallId, subagentType, tokensUsed} = {}) => {
+		// A stop with no measured token count is noise, not a run: it must never create an
+		// entry, finalize anything, or move a total. (`subagent_progress` carries an
+		// estimate and is deliberately never subscribed to, for the same reason.)
+		const tokens = num(tokensUsed);
+		if (tokens <= 0 || typeof toolCallId !== 'string') return;
+		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
+		entry.tokensUsed = tokens;
+		finalizeSubagent(entry);
 	});
 
 	cmd.on('session_start', () => resetSession());
@@ -576,6 +652,18 @@ export default function (cmd: ModApi): void {
 	cmd.hooks({
 		onRunEnd: async ({result} = {}) => {
 			finalizeRun(result);
+		},
+	});
+
+	cmd.hooks({
+		afterToolCall: ({toolCallId, toolName} = {}) => {
+			// A foreground sub-agent is done when the `agent` tool call that launched it
+			// completes. The result is not needed for the accounting (a later change parses
+			// it), only the fact that the call is over.
+			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
+			const entry = subagentEntry(toolCallId);
+			entry.agentDone = true;
+			finalizeSubagent(entry);
 		},
 	});
 
@@ -631,8 +719,8 @@ export default function (cmd: ModApi): void {
 			row('context', contextLine()),
 			row('models', modelLines(byModel)),
 		];
-		if (subagentCalls > 0) {
-			lines.push(row('subagents', `${plural(subagentCalls, 'run')} · ${formatTokens(subagentTokens)} tokens`));
+		if (subagentRuns > 0) {
+			lines.push(row('subagents', `${plural(subagentRuns, 'run')} · ${formatTokens(subagentTokens)} tokens`));
 		}
 		lines.push(row('log', `${LOG_PATH} · ${plural(log.length, 'record')}`));
 		return lines.join('\n');

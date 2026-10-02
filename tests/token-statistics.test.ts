@@ -183,6 +183,7 @@ test('registers the flags, command, renderer and events it documents', () => {
 		'run_start',
 		'model_request_start',
 		'model_request_end',
+		'subagent_start',
 		'subagent_stop',
 		'session_start',
 		'session_shutdown',
@@ -190,6 +191,8 @@ test('registers the flags, command, renderer and events it documents', () => {
 	]) {
 		assert.ok(fake.events.has(event), `missing event subscription ${event}`);
 	}
+	// subagent_progress carries an estimate, not a measurement — it must never be read.
+	assert.equal(fake.events.has('subagent_progress'), false, 'subagent_progress must not be subscribed');
 });
 
 // ---------------------------------------------------------------------------
@@ -391,24 +394,140 @@ test('the nested AI SDK usage shape is understood too', (t) => {
 // Sub-agents (informational only)
 // ---------------------------------------------------------------------------
 
-test('sub-agent activity is reported but never folded into the totals', async (t) => {
+// A sub-agent is launched by an `agent` tool call, so its ledger is keyed by tool call id.
+function startSubagent(fake: FakeMod, payload: Record<string, unknown>): void {
+	fake.emit('subagent_start', {description: 'do a thing', background: false, showOutput: false, ...payload});
+}
+
+function stopSubagent(fake: FakeMod, payload: Record<string, unknown>): void {
+	fake.emit('subagent_stop', {status: 'ok', ...payload});
+}
+
+// The `agent` tool call that launched a sub-agent has finished.
+function finishAgentCall(fake: FakeMod, toolCallId: string, toolName = 'agent'): void {
+	fake.hook('afterToolCall', {toolCallId, toolName, result: 'anything'});
+}
+
+function report(fake: FakeMod): string {
+	return fake.commands.get('token-stats')!().message;
+}
+
+test('sub-agent tokens are shown but never folded into the totals', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
-	fake.emit('subagent_stop', {subagentType: 'explore', tokensUsed: 4200});
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCall(fake, 'call-1');
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	const record = readLogLines()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
-	// The sub-agent's tokens are shown, not summed: lifetime input is only the call's 100.
+	// Shown, never summed: lifetime input is only the parent call's 100.
 	assert.equal(readState().lifetime.input, 100);
+	assert.equal(readState().lifetime.output, 10);
 
-	const message = fake.commands.get('token-stats')!().message;
-	assert.match(message, /subagents/);
-	assert.match(message, /4\.2k tokens/);
+	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /4\.2k tokens/);
+});
+
+test('a foreground sub-agent finalizes only when its agent tool call completes', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+
+	assert.doesNotMatch(report(fake), /subagents/, 'not final before the agent tool call finishes');
+
+	// Some other tool finishing must not finalize it.
+	finishAgentCall(fake, 'call-1', 'read');
+	assert.doesNotMatch(report(fake), /subagents/);
+
+	finishAgentCall(fake, 'call-1');
+	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /4\.2k tokens/);
+});
+
+test('a background sub-agent finalizes on its stop, with no agent tool call', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
+
+	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /1k tokens/);
+
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+	const record = readLogLines()[0];
+	assert.equal(record.subagents, 1);
+	assert.equal(record.subagentTokens, 1000);
+});
+
+test('a stop with no usable token count is ignored entirely', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 0});
+	// Stops with no count, a bogus count, or no start at all must not create a run.
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: Number.NaN});
+	stopSubagent(fake, {toolCallId: 'call-3', subagentType: 'explore', tokensUsed: '1200'});
+	stopSubagent(fake, {toolCallId: 'call-4', subagentType: 'explore'});
+	finishAgentCall(fake, 'call-1');
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	assert.doesNotMatch(report(fake), /subagents/);
+	const record = readLogLines()[0];
+	assert.equal(record.subagents, 0);
+	assert.equal(record.subagentTokens, 0);
+});
+
+test('the run-end sweep finalizes a foreground sub-agent that never completed', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	assert.doesNotMatch(report(fake), /subagents/);
+
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const record = readLogLines()[0];
+	assert.equal(record.subagents, 1);
+	assert.equal(record.subagentTokens, 4200);
+});
+
+test('finalization is idempotent', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	// A repeated stop, the run-end sweep and a late tool-call completion must all no-op.
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+	fake.emit('run_end', {result: {stopReason: 'end_turn'}});
+	finishAgentCall(fake, 'call-1');
+
+	assert.equal(readLogLines().length, 1);
+	const record = readLogLines()[0];
+	assert.equal(record.subagents, 1);
+	assert.equal(record.subagentTokens, 4200);
+	assert.match(report(fake), /1 run · 4\.2k tokens/);
 });
 
 test('the per-run sub-agent count does not leak into the next run', async (t) => {
@@ -417,7 +536,8 @@ test('the per-run sub-agent count does not leak into the next run', async (t) =>
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
-	fake.emit('subagent_stop', {subagentType: 'explore', tokensUsed: 4200});
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', tokensUsed: 4200});
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	fake.emit('run_start', {sessionId: 's1'});
@@ -429,6 +549,32 @@ test('the per-run sub-agent count does not leak into the next run', async (t) =>
 	assert.equal(lines[0].subagentTokens, 4200);
 	assert.equal(lines[1].subagents, 0);
 	assert.equal(lines[1].subagentTokens, 0);
+});
+
+test('subagent_progress is never subscribed or summed', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	// The progress stream carries an estimate; it must not reach any total or counter.
+	fake.emit('subagent_progress', {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 50_000});
+
+	assert.doesNotMatch(report(fake), /subagents/);
+	assert.match(report(fake), /▲ 100 in/);
+});
+
+test('a new session starts with no sub-agent activity to report', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', background: true});
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', tokensUsed: 4200});
+	assert.match(report(fake), /subagents/);
+
+	fake.emit('session_start', {sessionId: 's2'});
+	assert.doesNotMatch(report(fake), /subagents/);
 });
 
 // ---------------------------------------------------------------------------
