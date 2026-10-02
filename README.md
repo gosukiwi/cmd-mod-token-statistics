@@ -42,15 +42,21 @@ Token statistics · my-app
   log       ~/.commandcode/token-statistics.log.jsonl · 412 records
 ```
 
-**A durable log** — `~/.commandcode/token-statistics.log.jsonl`, one JSON line per run, never
-rewritten:
+**A durable log** — `~/.commandcode/token-statistics.log.jsonl`, one JSON line per run plus one
+per finalized sub-agent, never rewritten:
 
 ```json
 {"ts":"2026-09-27T09:31:02.114Z","sessionId":"…","cwd":"/Users/me/app","stopReason":"end_turn",
  "input":128400,"output":12300,"cacheRead":100200,"cacheWrite":6100,"requests":24,
  "models":["claude-sonnet-5"],"durationMs":8400,"genMs":3100,"outputTokPerSec":41.2,
  "subagents":1,"subagentTokens":4200}
+{"ts":"2026-09-27T09:31:04.006Z","kind":"subagent","sessionId":"…","toolCallId":"call-7",
+ "subagentType":"explore","tokensUsed":667762,"turns":19,"toolUses":63,"durationMs":117189,
+ "totalTokens":1256306}
 ```
+
+The per-sub-agent line carries the counts from the `agent` tool's usage trailer; the trailer
+fields are omitted when the tool did not report them.
 
 Because the log is append-only and the aggregates live in a small companion JSON, both the
 footer and `/token-stats` stay fast however long you have been running.
@@ -127,7 +133,7 @@ The file is re-read when it changes, so edits land without a reload.
 | Path | What it is |
 |---|---|
 | `~/.commandcode/token-statistics.json` | Settings + lifetime/per-model aggregates (rewritten per run, atomically). |
-| `~/.commandcode/token-statistics.log.jsonl` | Append-only, one record per run. Safe to keep, grep, or chart. |
+| `~/.commandcode/token-statistics.log.jsonl` | Append-only, one record per run plus one per sub-agent. Safe to keep, grep, or chart. |
 
 Both are created on first run. Nothing is sent anywhere — the mod makes no network calls.
 

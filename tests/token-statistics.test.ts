@@ -150,6 +150,16 @@ function readLogLines(): any[] {
 	}
 }
 
+// The durable log holds two record kinds: the per-run summary and one line per finalized
+// sub-agent. These pick one kind out of the interleaved stream.
+function runRecords(): any[] {
+	return readLogLines().filter((record) => record.kind !== 'subagent');
+}
+
+function subagentRecords(): any[] {
+	return readLogLines().filter((record) => record.kind === 'subagent');
+}
+
 function settle(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
@@ -408,6 +418,16 @@ function finishAgentCall(fake: FakeMod, toolCallId: string, toolName = 'agent'):
 	fake.hook('afterToolCall', {toolCallId, toolName, result: 'anything'});
 }
 
+// The same completion, but with a specific result — the `agent` tool's result text carries
+// a `<usage>` trailer that the mod parses.
+function finishAgentCallWithResult(fake: FakeMod, toolCallId: string, result: unknown, toolName = 'agent'): void {
+	fake.hook('afterToolCall', {toolCallId, toolName, result});
+}
+
+// The real trailer shape, verbatim from the `agent` tool.
+const USAGE_TRAILER =
+	'Investigated the module.\n<usage>total_tokens: 1256306\ntool_uses: 63\nturns: 19\nduration_ms: 117189</usage>';
+
 function report(fake: FakeMod): string {
 	return fake.commands.get('token-stats')!().message;
 }
@@ -423,7 +443,7 @@ test('sub-agent tokens are shown but never folded into the totals', async (t) =>
 	finishAgentCall(fake, 'call-1');
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
-	const record = readLogLines()[0];
+	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
 	// Shown, never summed: lifetime input is only the parent call's 100.
@@ -466,7 +486,7 @@ test('a background sub-agent finalizes on its stop, with no agent tool call', as
 	assert.match(report(fake), /1k tokens/);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
-	const record = readLogLines()[0];
+	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 1000);
 });
@@ -487,9 +507,11 @@ test('a stop with no usable token count is ignored entirely', async (t) => {
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	assert.doesNotMatch(report(fake), /subagents/);
-	const record = readLogLines()[0];
+	const record = runRecords()[0];
 	assert.equal(record.subagents, 0);
 	assert.equal(record.subagentTokens, 0);
+	// Nothing was finalized, so no per-sub-agent record was written either.
+	assert.equal(subagentRecords().length, 0);
 });
 
 test('the run-end sweep finalizes a foreground sub-agent that never completed', async (t) => {
@@ -504,9 +526,10 @@ test('the run-end sweep finalizes a foreground sub-agent that never completed', 
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
-	const record = readLogLines()[0];
+	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
+	assert.equal(subagentRecords().length, 1, 'the swept sub-agent still gets its own record');
 });
 
 test('finalization is idempotent', async (t) => {
@@ -523,8 +546,11 @@ test('finalization is idempotent', async (t) => {
 	fake.emit('run_end', {result: {stopReason: 'end_turn'}});
 	finishAgentCall(fake, 'call-1');
 
-	assert.equal(readLogLines().length, 1);
-	const record = readLogLines()[0];
+	// A repeated stop, the run-end sweep and a late tool-call completion must all no-op —
+	// including the durable per-sub-agent record, which lands exactly once.
+	assert.equal(runRecords().length, 1);
+	assert.equal(subagentRecords().length, 1);
+	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
 	assert.match(report(fake), /1 run · 4\.2k tokens/);
@@ -544,7 +570,7 @@ test('the per-run sub-agent count does not leak into the next run', async (t) =>
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
-	const lines = readLogLines();
+	const lines = runRecords();
 	assert.equal(lines[0].subagents, 1);
 	assert.equal(lines[0].subagentTokens, 4200);
 	assert.equal(lines[1].subagents, 0);
@@ -575,6 +601,201 @@ test('a new session starts with no sub-agent activity to report', (t) => {
 
 	fake.emit('session_start', {sessionId: 's2'});
 	assert.doesNotMatch(report(fake), /subagents/);
+});
+
+// ---------------------------------------------------------------------------
+// Per-sub-agent durable log record
+// ---------------------------------------------------------------------------
+
+test('a finalized sub-agent appends one durable record with its parsed usage trailer', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 667762});
+	finishAgentCallWithResult(fake, 'call-1', USAGE_TRAILER);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const records = subagentRecords();
+	assert.equal(records.length, 1);
+	const [record] = records;
+	// Key order is part of the contract.
+	assert.deepEqual(Object.keys(record), [
+		'ts',
+		'kind',
+		'sessionId',
+		'toolCallId',
+		'subagentType',
+		'tokensUsed',
+		'turns',
+		'toolUses',
+		'durationMs',
+		'totalTokens',
+	]);
+	assert.equal(typeof record.ts, 'string');
+	assert.equal(record.kind, 'subagent');
+	assert.equal(record.sessionId, 's1');
+	assert.equal(record.toolCallId, 'call-1');
+	assert.equal(record.subagentType, 'explore');
+	assert.equal(record.tokensUsed, 667762);
+	assert.equal(record.turns, 19);
+	assert.equal(record.toolUses, 63);
+	assert.equal(record.durationMs, 117189);
+	assert.equal(record.totalTokens, 1256306);
+});
+
+test('the per-run record keeps its subagent fields alongside the subagent record', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 667762});
+	finishAgentCallWithResult(fake, 'call-1', USAGE_TRAILER);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [run] = runRecords();
+	assert.equal(run.subagents, 1);
+	assert.equal(run.subagentTokens, 667762);
+	assert.equal(run.kind, undefined, 'the per-run line is unchanged — no kind field');
+	assert.equal(subagentRecords().length, 1);
+});
+
+test('a missing usage trailer leaves the extra fields off the record', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallWithResult(fake, 'call-1', 'done, nothing to report here');
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [record] = subagentRecords();
+	assert.deepEqual(Object.keys(record), [
+		'ts',
+		'kind',
+		'sessionId',
+		'toolCallId',
+		'subagentType',
+		'tokensUsed',
+	]);
+	assert.equal(record.tokensUsed, 4200);
+});
+
+test('a trailer with a missing or non-numeric key keeps only the known fields', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallWithResult(fake, 'call-1', '<usage>total_tokens: not-a-number\nturns: 19</usage>');
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [record] = subagentRecords();
+	assert.deepEqual(Object.keys(record), [
+		'ts',
+		'kind',
+		'sessionId',
+		'toolCallId',
+		'subagentType',
+		'tokensUsed',
+		'turns',
+	]);
+	assert.equal(record.turns, 19);
+	assert.equal(record.totalTokens, undefined);
+});
+
+test('a non-string agent result is tolerated and carries no trailer', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	assert.doesNotThrow(() =>
+		finishAgentCallWithResult(fake, 'call-1', {not: 'a string with a trailer'}),
+	);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [record] = subagentRecords();
+	assert.deepEqual(Object.keys(record), [
+		'ts',
+		'kind',
+		'sessionId',
+		'toolCallId',
+		'subagentType',
+		'tokensUsed',
+	]);
+	assert.equal(record.tokensUsed, 4200);
+});
+
+test('a background sub-agent logs on its stop, before any trailer is known', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
+
+	// The record lands at stop time, while the run is still going, with no trailer yet.
+	const [record] = subagentRecords();
+	assert.ok(record, 'the stop alone is enough to write the record');
+	assert.equal(record.toolCallId, 'bg-1');
+	assert.equal(record.subagentType, 'review');
+	assert.equal(record.tokensUsed, 1000);
+	assert.deepEqual(Object.keys(record), [
+		'ts',
+		'kind',
+		'sessionId',
+		'toolCallId',
+		'subagentType',
+		'tokensUsed',
+	]);
+});
+
+test('the log setting suppresses per-sub-agent records too', async (t) => {
+	useFakeTimers(t);
+	const fake = setup({flags: {'token-stats-log': false}});
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallWithResult(fake, 'call-1', USAGE_TRAILER);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	assert.deepEqual(readLogLines(), [], 'the whole log stays empty when logging is off');
+});
+
+test('a failed sub-agent log write warns without crashing the finalize', async (t) => {
+	useFakeTimers(t);
+	// Put a directory where the log file belongs, so every append throws.
+	mkdirSync(LOG, {recursive: true});
+	t.after(() => rmSync(LOG, {recursive: true, force: true}));
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+
+	assert.doesNotThrow(() => finishAgentCallWithResult(fake, 'call-1', USAGE_TRAILER));
+	assert.ok(
+		fake.notices.some((notice) => /could not save/.test(notice)),
+		'the write failure goes through the existing warn path',
+	);
+	// The run still reports its own totals despite the failed log write.
+	await assert.doesNotReject(() => fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}}));
+	assert.match(report(fake), /subagents/);
 });
 
 // ---------------------------------------------------------------------------

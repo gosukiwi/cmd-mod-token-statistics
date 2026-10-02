@@ -90,14 +90,25 @@ interface Usage {
 	readonly cacheWrite: number;
 }
 
+// The usage trailer the `agent` tool appends to its result text. Every field is optional:
+// the whole block may be absent, or a key may be missing or not a number.
+interface SubagentTrailer {
+	readonly turns?: number;
+	readonly toolUses?: number;
+	readonly durationMs?: number;
+	readonly totalTokens?: number;
+}
+
 // One in-flight sub-agent, keyed by the `agent` tool call that launched it. A stop carries
 // the token count, but the entry is only finalizable once the sub-agent is known to be done:
 // a background one is done when it stops, a foreground one when its tool call completes.
 interface SubagentRun {
+	toolCallId: string;
 	subagentType: string | undefined;
 	background: boolean;
 	agentDone: boolean;
 	tokensUsed: number;
+	trailer: SubagentTrailer | undefined;
 	finalized: boolean;
 }
 
@@ -117,6 +128,22 @@ interface RunRecord {
 	readonly outputTokPerSec: number;
 	readonly subagents: number;
 	readonly subagentTokens: number;
+}
+
+// One durable line per finalized sub-agent, alongside the per-run lines. The four trailer
+// fields are dropped by JSON.stringify when undefined, so an unknown value never lands as
+// null — the key is simply absent.
+interface SubagentRecord {
+	readonly ts: string;
+	readonly kind: 'subagent';
+	readonly sessionId: string | undefined;
+	readonly toolCallId: string;
+	readonly subagentType: string | undefined;
+	readonly tokensUsed: number;
+	readonly turns?: number;
+	readonly toolUses?: number;
+	readonly durationMs?: number;
+	readonly totalTokens?: number;
 }
 
 function zeros(): Totals {
@@ -140,6 +167,34 @@ function readUsage(raw: unknown): Usage {
 		output: num(usage.outputTokens),
 		cacheRead: num(usage.cacheReadTokens ?? details.cacheReadTokens ?? usage.cachedInputTokens),
 		cacheWrite: num(usage.cacheWriteTokens ?? details.cacheWriteTokens),
+	};
+}
+
+// Parse the `<usage>` trailer the `agent` tool appends to its result text:
+//
+//   <usage>total_tokens: 1256306
+//   tool_uses: 63
+//   turns: 19
+//   duration_ms: 117189</usage>
+//
+// Tolerant by design: a non-string result, a missing block, or a key that is absent or not
+// a number leaves that field (or the whole trailer) undefined — never an exception.
+function parseSubagentTrailer(result: unknown): SubagentTrailer | undefined {
+	if (typeof result !== 'string') return undefined;
+	const block = result.match(/<usage>([\s\S]*?)<\/usage>/);
+	if (block === null) return undefined;
+	const body = block[1];
+	const read = (key: string): number | undefined => {
+		const match = body.match(new RegExp(`\\b${key}\\s*:\\s*([^\\s]+)`));
+		if (match === null) return undefined;
+		const value = Number(match[1]);
+		return Number.isFinite(value) ? value : undefined;
+	};
+	return {
+		totalTokens: read('total_tokens'),
+		toolUses: read('tool_uses'),
+		turns: read('turns'),
+		durationMs: read('duration_ms'),
 	};
 }
 
@@ -348,7 +403,10 @@ export default function (cmd: ModApi): void {
 		warn(`token-statistics: could not save stats to ${CONFIG_PATH} (${describeError(error)}).`);
 	}
 
-	function appendLog(record: RunRecord): void {
+	// Two record kinds share the one append-only log: the per-run summary and one line per
+	// finalized sub-agent. Both go through here so the write path (and its failure mode) is
+	// identical.
+	function appendLog(record: RunRecord | SubagentRecord): void {
 		mkdirSync(dirname(LOG_PATH), {recursive: true});
 		appendFileSync(LOG_PATH, `${JSON.stringify(record)}\n`);
 	}
@@ -437,7 +495,15 @@ export default function (cmd: ModApi): void {
 	function subagentEntry(toolCallId: string, subagentType?: string): SubagentRun {
 		let entry = subagentLedger.get(toolCallId);
 		if (entry === undefined) {
-			entry = {subagentType, background: false, agentDone: false, tokensUsed: 0, finalized: false};
+			entry = {
+				toolCallId,
+				subagentType,
+				background: false,
+				agentDone: false,
+				tokensUsed: 0,
+				trailer: undefined,
+				finalized: false,
+			};
 			subagentLedger.set(toolCallId, entry);
 		}
 		if (entry.subagentType === undefined && subagentType !== undefined) entry.subagentType = subagentType;
@@ -463,6 +529,34 @@ export default function (cmd: ModApi): void {
 		subagentTokens += entry.tokensUsed;
 		runSubagentRuns += 1;
 		runSubagentTokens += entry.tokensUsed;
+
+		writeSubagentRecord(entry);
+	}
+
+	// One durable line per finalized sub-agent, alongside the per-run lines. Gated by the
+	// same `log` setting as the per-run record, and routed through the same warn-on-failure
+	// path so a bad write can never take the session down.
+	function writeSubagentRecord(entry: SubagentRun): void {
+		if (!resolveSettings().log) return;
+		const record: SubagentRecord = {
+			ts: new Date().toISOString(),
+			kind: 'subagent',
+			sessionId,
+			toolCallId: entry.toolCallId,
+			subagentType: entry.subagentType,
+			tokensUsed: entry.tokensUsed,
+			// The trailer fields are optional; undefined values are dropped by JSON.stringify,
+			// so an unknown one is simply absent rather than null.
+			turns: entry.trailer?.turns,
+			toolUses: entry.trailer?.toolUses,
+			durationMs: entry.trailer?.durationMs,
+			totalTokens: entry.trailer?.totalTokens,
+		};
+		try {
+			appendLog(record);
+		} catch (error) {
+			warnWriteFailure(error);
+		}
 	}
 
 	// The end of a run is the last chance to account for anything still in the ledger — the
@@ -656,12 +750,14 @@ export default function (cmd: ModApi): void {
 	});
 
 	cmd.hooks({
-		afterToolCall: ({toolCallId, toolName} = {}) => {
+		afterToolCall: ({toolCallId, toolName, result} = {}) => {
 			// A foreground sub-agent is done when the `agent` tool call that launched it
-			// completes. The result is not needed for the accounting (a later change parses
-			// it), only the fact that the call is over.
+			// completes. The result text also carries the sub-agent's usage trailer, so parse
+			// it here — before finalizing — so the durable record written at commit time can
+			// include it.
 			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
 			const entry = subagentEntry(toolCallId);
+			entry.trailer = parseSubagentTrailer(result);
 			entry.agentDone = true;
 			finalizeSubagent(entry);
 		},
