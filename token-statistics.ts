@@ -542,11 +542,21 @@ export default function (cmd: ModApi): void {
 	// record) were built from. Handlers declare only the facts they learned; the invariant
 	// lives here. The entry is opened lazily, so an event with no prior subagent_start still
 	// records what it knows.
-	function updateSubagent(toolCallId: string, patch: Partial<SubagentRun>, subagentType?: string): void {
+	//
+	// `shouldFinalize` separates a fact that could complete the entry (a stop, a tool-call
+	// completion, the run-end sweep) from one that never can (a start, which only declares
+	// where and how the sub-agent runs). A start that finalized would commit the entry before
+	// its token count — or its trailer — had a chance to arrive.
+	function updateSubagent(
+		toolCallId: string,
+		patch: Partial<SubagentRun>,
+		subagentType?: string,
+		shouldFinalize = false,
+	): void {
 		const entry = subagentEntry(toolCallId, subagentType);
 		if (entry.finalized) return;
 		Object.assign(entry, patch);
-		finalizeSubagent(entry);
+		if (shouldFinalize) finalizeSubagent(entry);
 	}
 
 	// A sub-agent counts exactly once, and only once its tokens are known AND it is known to
@@ -596,9 +606,14 @@ export default function (cmd: ModApi): void {
 	// afterToolCall).
 	function sweepSubagents(): void {
 		for (const entry of subagentLedger.values()) {
+			// Only an entry that already holds a token count is this run's to book. A
+			// zero-token entry is left entirely untouched: marking it done would let a *later*
+			// stop finalize a foreground sub-agent whose `agent` tool call never completed —
+			// something the run ending is not a completion signal for.
+			if (entry.tokensUsed <= 0) continue;
 			// The run ending is itself a completion signal; updateSubagent keeps the
 			// finalized-immutability rule in one place and skips anything already booked.
-			updateSubagent(entry.toolCallId, {agentDone: true});
+			updateSubagent(entry.toolCallId, {agentDone: true}, undefined, true);
 		}
 	}
 
@@ -772,9 +787,11 @@ export default function (cmd: ModApi): void {
 
 	cmd.on('subagent_start', ({toolCallId, subagentType, background} = {}) => {
 		if (typeof toolCallId !== 'string') return;
-		// Declare the facts: the run the sub-agent was launched in (for attribution when it
-		// finalizes), and that a background one outlives the tool call that launched it — so
-		// its stop is already its completion signal.
+		// Declare the facts only: the run the sub-agent was launched in (for attribution when
+		// it finalizes), and that a background one outlives the tool call that launched it —
+		// so its stop is already its completion signal. A start never finalizes: the entry's
+		// token count and its trailer are still to come (and a duplicate/out-of-order start
+		// must not commit the entry before them).
 		updateSubagent(
 			toolCallId,
 			{runNumber: run.epoch, background: background === true},
@@ -791,7 +808,12 @@ export default function (cmd: ModApi): void {
 		// The finalized-entry immutability rule lives in updateSubagent: a late stop cannot
 		// rewrite the count its committed totals (and its durable record) were built from, or
 		// the report's cache numerator would drift away from its latched denominator.
-		updateSubagent(toolCallId, {tokensUsed: tokens}, typeof subagentType === 'string' ? subagentType : undefined);
+		updateSubagent(
+			toolCallId,
+			{tokensUsed: tokens},
+			typeof subagentType === 'string' ? subagentType : undefined,
+			true,
+		);
 	});
 
 	cmd.on('session_start', () => resetSession());
@@ -817,7 +839,7 @@ export default function (cmd: ModApi): void {
 			// arriving after commit is dropped by updateSubagent — it could only make the
 			// report claim a cache figure the durable record cannot support.
 			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
-			updateSubagent(toolCallId, {trailer: parseSubagentTrailer(result), agentDone: true});
+			updateSubagent(toolCallId, {trailer: parseSubagentTrailer(result), agentDone: true}, undefined, true);
 		},
 	});
 

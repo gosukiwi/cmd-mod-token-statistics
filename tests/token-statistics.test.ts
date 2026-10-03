@@ -599,6 +599,67 @@ test('the run-end sweep finalizes a foreground sub-agent that never completed', 
 	assert.equal(subagentRecords().length, 1, 'the swept sub-agent still gets its own record');
 });
 
+// ---------------------------------------------------------------------------
+// Refactor regressions — the sweep and subagent_start must not finalize early
+// ---------------------------------------------------------------------------
+
+// Regression 1: the run-end sweep used to stamp `agentDone = true` on EVERY ledger entry
+// before finalizing. The flag persists, so a *foreground* sub-agent that stopped later —
+// while no run was in flight — finalized through the `agentDone` branch, producing a
+// subagents line and a durable record the old sweep never created. The sweep must only act
+// on entries that already hold a token count, leaving a zero-token entry untouched.
+test('the run-end sweep leaves a zero-token entry untouched', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', background: false});
+	// The run ends before the sub-agent has reported any tokens.
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	// The foreground sub-agent stops while the session is idle. Its `agent` tool call never
+	// completed, so it is not done and must not be counted: no line, no durable record.
+	stopSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', tokensUsed: 5000});
+
+	assert.doesNotMatch(report(fake), /subagents/, 'no subagents line is shown');
+	assert.equal(subagentLine(fake), '');
+	assert.equal(subagentRecords().length, 0, 'no kind:"subagent" record is written');
+});
+
+// Regression 2: subagent_start used to route through the finalizing mutation point, so an
+// out-of-order/duplicate start that arrived after the stop finalized the entry on the spot.
+// The `finalized` latch then dropped the `afterToolCall` trailer, withholding the cache
+// figure. A start must only declare its facts (run/epoch, background) without finalizing.
+test('a duplicate subagent_start does not finalize before the trailer is parsed', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', background: false});
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+	stopSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', tokensUsed: 9000});
+	// The duplicate start flips the entry to background *after* the stop. It must not commit
+	// the entry — the `agent` tool call's trailer is still to come.
+	startSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', background: true});
+	finishAgentCallWithResult(
+		fake,
+		'c1',
+		'x\n\n<usage>total_tokens: 4000\ntool_uses: 2\nturns: 1\nduration_ms: 5</usage>',
+	);
+
+	const [record] = subagentRecords();
+	assert.ok(record, 'the entry finalizes on the agent tool-call completion');
+	assert.equal(record.tokensUsed, 9000);
+	assert.equal(record.totalTokens, 4000);
+	assert.equal(record.turns, 1);
+	assert.equal(record.toolUses, 2);
+	assert.equal(record.durationMs, 5);
+	// The trailer is known, so the cache cluster is shown (a floor of 0% here).
+	assert.match(subagentLine(fake), /⛁ ≥0% cached/);
+});
+
 test('finalization is idempotent', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
