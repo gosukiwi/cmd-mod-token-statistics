@@ -882,30 +882,19 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
-	// At most two lines: the session totals, plus a sub-agent line when one has been counted.
+	// One line: the session totals, plus an inline sub-agent cluster when one has been counted.
 	function reportText(): string {
 		if (session.requests === 0 && session.input === 0 && session.output === 0) {
 			return 'no requests recorded yet this session';
 		}
-		const lines = [
-			row(
-				'session',
-				`▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`,
-			),
-		];
+		let line = `▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`;
 		if (subagentRuns > 0) {
 			// The cache cluster is all-or-nothing: a `≥` bound is only worth printing when it
 			// is a bound on every run shown.
 			const cached = subagentCacheTokens();
 			const cache = cached === undefined ? '' : `  ⛁ ≥${percent(cached, subagentTokens)}% cached`;
-			lines.push(
-				row('subagents', `${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`),
-			);
+			line += `  ·  sub ${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`;
 		}
-		return lines.join('\n');
-	}
-
-	function row(label: string, value: string): string {
-		return `  ${label.padEnd(10)}${value}`;
+		return line;
 	}
 }

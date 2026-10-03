@@ -516,7 +516,7 @@ test('sub-agent tokens are shown but never folded into the totals', async (t) =>
 	assert.equal(readState().lifetime.input, 100);
 	assert.equal(readState().lifetime.output, 10);
 
-	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /·  sub /);
 	assert.match(report(fake), /4\.2k tok · 1 run/);
 });
 
@@ -529,14 +529,14 @@ test('a foreground sub-agent finalizes only when its agent tool call completes',
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 
-	assert.doesNotMatch(report(fake), /subagents/, 'not final before the agent tool call finishes');
+	assert.doesNotMatch(report(fake), /·  sub /, 'not final before the agent tool call finishes');
 
 	// Some other tool finishing must not finalize it.
 	finishAgentCall(fake, 'call-1', 'read');
-	assert.doesNotMatch(report(fake), /subagents/);
+	assert.doesNotMatch(report(fake), /·  sub /);
 
 	finishAgentCall(fake, 'call-1');
-	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /·  sub /);
 	assert.match(report(fake), /4\.2k tok · 1 run/);
 });
 
@@ -549,7 +549,7 @@ test('a background sub-agent finalizes on its stop, with no agent tool call', as
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
 
-	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /·  sub /);
 	assert.match(report(fake), /1k tok · 1 run/);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
@@ -573,7 +573,7 @@ test('a stop with no usable token count is ignored entirely', async (t) => {
 	finishAgentCall(fake, 'call-1');
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
-	assert.doesNotMatch(report(fake), /subagents/);
+	assert.doesNotMatch(report(fake), /·  sub /);
 	const record = runRecords()[0];
 	assert.equal(record.subagents, 0);
 	assert.equal(record.subagentTokens, 0);
@@ -589,7 +589,7 @@ test('the run-end sweep finalizes a foreground sub-agent that never completed', 
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
-	assert.doesNotMatch(report(fake), /subagents/);
+	assert.doesNotMatch(report(fake), /·  sub /);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
@@ -622,7 +622,7 @@ test('the run-end sweep leaves a zero-token entry untouched', async (t) => {
 	// completed, so it is not done and must not be counted: no line, no durable record.
 	stopSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', tokensUsed: 5000});
 
-	assert.doesNotMatch(report(fake), /subagents/, 'no subagents line is shown');
+	assert.doesNotMatch(report(fake), /·  sub /, 'no subagents line is shown');
 	assert.equal(subagentLine(fake), '');
 	assert.equal(subagentRecords().length, 0, 'no kind:"subagent" record is written');
 });
@@ -754,7 +754,7 @@ test('a background sub-agent that outlives its run is never claimed by a later r
 	assert.equal(lines[1].subagentTokens, 0);
 
 	// The session view and the per-sub-agent record still account for it.
-	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 4.2k tok · 1 run');
 	assert.equal(subagentRecords().length, 1);
 });
 
@@ -777,7 +777,7 @@ test('a background sub-agent that stops while the session is idle is written to 
 	assert.equal(lines[0].subagentTokens, 0);
 
 	// The session line and the durable per-sub-agent record still account for it.
-	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 4.2k tok · 1 run');
 	assert.equal(subagentRecords().length, 1);
 });
 
@@ -790,7 +790,7 @@ test('subagent_progress is never subscribed or summed', (t) => {
 	// The progress stream carries an estimate; it must not reach any total or counter.
 	fake.emit('subagent_progress', {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 50_000});
 
-	assert.doesNotMatch(report(fake), /subagents/);
+	assert.doesNotMatch(report(fake), /·  sub /);
 	assert.match(report(fake), /▲ 100 in/);
 });
 
@@ -802,11 +802,11 @@ test('a new session starts with no sub-agent activity to report', (t) => {
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', background: true});
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', tokensUsed: 4200});
-	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /·  sub /);
 
 	fake.emit('session_start', {sessionId: 's2'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
-	assert.doesNotMatch(report(fake), /subagents/);
+	assert.doesNotMatch(report(fake), /·  sub /);
 });
 
 // ---------------------------------------------------------------------------
@@ -839,7 +839,7 @@ test('the real content-block result carries the usage trailer into the record an
 	assert.equal(record.totalTokens, 6300);
 	assert.equal(record.tokensUsed, 4200);
 	// 6300 − 4200 = 2100 cached of 4200 spent is 50%.
-	assert.equal(subagentLine(fake), '  subagents 4.2k tok  ⛁ ≥50% cached · 1 run');
+	assert.equal(subagentLine(fake), 'sub 4.2k tok  ⛁ ≥50% cached · 1 run');
 });
 
 test('a bare-string agent result is still parsed for the trailer (tolerance)', async (t) => {
@@ -893,7 +893,7 @@ test('an empty or non-text content array yields no trailer and does not throw', 
 			'tokensUsed',
 		]);
 	}
-	assert.equal(subagentLine(fake), '  subagents 4.7k tok · 2 runs');
+	assert.equal(subagentLine(fake), 'sub 4.7k tok · 2 runs');
 });
 
 test('a finalized sub-agent appends one durable record with its parsed usage trailer', async (t) => {
@@ -1052,7 +1052,7 @@ test('a background sub-agent logs on its stop, before any trailer is known', asy
 		'tokensUsed',
 	]);
 	// An unauditable sub-agent withholds the cache cluster entirely.
-	assert.equal(subagentLine(fake), '  subagents 1k tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1k tok · 1 run');
 });
 
 test('the log setting suppresses per-sub-agent records too', async (t) => {
@@ -1088,7 +1088,7 @@ test('a failed sub-agent log write warns without crashing the finalize', async (
 	);
 	// The run still reports its own totals despite the failed log write.
 	await assert.doesNotReject(() => fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}}));
-	assert.match(report(fake), /subagents/);
+	assert.match(report(fake), /·  sub /);
 });
 
 // ---------------------------------------------------------------------------
@@ -1130,30 +1130,29 @@ test('/token-stats prints exactly one session line, and no lifetime, models or l
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	const message = fake.commands.get('token-stats')!().message;
-	// One line, no header, and neither the `(N written)` nor the `· N requests` suffix.
-	assert.equal(message, '  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached');
+	// One line, no label/header, and neither the `(N written)` nor the `· N requests` suffix.
+	assert.equal(message, '▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached');
 });
 
-test('/token-stats adds a subagents line once a sub-agent has been counted', async (t) => {
+test('/token-stats appends the sub-agent cluster once a sub-agent has been counted', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'claude-sonnet-5', usage(20_000, 38, 12_400, 800), 1000);
 	assert.equal(
-		fake.commands.get('token-stats')!().message.split('\n').length,
-		1,
-		'no subagents line before any sub-agent is counted',
+		fake.commands.get('token-stats')!().message,
+		'▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached',
+		'no sub-agent cluster before any sub-agent is counted',
 	);
 
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 	finishAgentCall(fake, 'call-1');
 
-	const message = fake.commands.get('token-stats')!().message;
 	assert.equal(
-		message,
-		['  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached', '  subagents 4.2k tok · 1 run'].join('\n'),
+		fake.commands.get('token-stats')!().message,
+		'▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  sub 4.2k tok · 1 run',
 	);
 });
 
@@ -1192,9 +1191,10 @@ test('/token-stats reset clears the lifetime only after confirmation', async (t)
 // Subagent cache figure
 // ---------------------------------------------------------------------------
 
-// The subagents line of /token-stats — the second line, present once a sub-agent counts.
+// The inline sub-agent cluster of /token-stats, e.g. `sub 4.2k tok · 1 run`; empty when none.
 function subagentLine(fake: FakeMod): string {
-	return report(fake).split('\n')[1] ?? '';
+	const at = report(fake).indexOf('·  sub ');
+	return at === -1 ? '' : report(fake).slice(at + 3);
 }
 
 // A sub-agent whose trailer total exceeds what it spent: the difference is the prompt
@@ -1211,7 +1211,7 @@ test('the subagents line shows the cache figure when every trailer total is know
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
 
-	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1M tok  ⛁ ≥25% cached · 1 run');
 });
 
 test('the cache figure is withheld when a finalized sub-agent has no trailer total', (t) => {
@@ -1224,7 +1224,7 @@ test('the cache figure is withheld when a finalized sub-agent has no trailer tot
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', 'done, nothing to report here');
 
-	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1M tok · 1 run');
 });
 
 test('one unauditable sub-agent withholds the figure for the whole line', (t) => {
@@ -1243,7 +1243,7 @@ test('one unauditable sub-agent withholds the figure for the whole line', (t) =>
 	finishAgentCall(fake, 'call-2');
 	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
 
-	assert.equal(subagentLine(fake), '  subagents 1.5M tok · 2 runs');
+	assert.equal(subagentLine(fake), 'sub 1.5M tok · 2 runs');
 });
 
 test('the cache figure is withheld once a parent request wrote to the cache', (t) => {
@@ -1257,7 +1257,7 @@ test('the cache figure is withheld once a parent request wrote to the cache', (t
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
 
-	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1M tok · 1 run');
 });
 
 test('a cache write only withholds the figure for the session it happened in', (t) => {
@@ -1270,7 +1270,7 @@ test('a cache write only withholds the figure for the session it happened in', (
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
-	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1M tok · 1 run');
 
 	fake.emit('session_start', {sessionId: 's2'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
@@ -1278,7 +1278,7 @@ test('a cache write only withholds the figure for the session it happened in', (
 	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-2', CACHED_TRAILER);
 
-	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
+	assert.equal(subagentLine(fake), 'sub 1M tok  ⛁ ≥25% cached · 1 run');
 });
 
 test('the figure sums the per-sub-agent gaps and clamps a shortfall to zero', (t) => {
@@ -1297,7 +1297,7 @@ test('the figure sums the per-sub-agent gaps and clamps a shortfall to zero', (t
 	finishAgentCallWithResult(fake, 'call-2', '<usage>total_tokens: 400000</usage>');
 
 	// 250k cached of 1.5M spent.
-	assert.equal(subagentLine(fake), '  subagents 1.5M tok  ⛁ ≥17% cached · 2 runs');
+	assert.equal(subagentLine(fake), 'sub 1.5M tok  ⛁ ≥17% cached · 2 runs');
 });
 
 // A trailer whose total sits a little above the measured spend, so the cache figure works
@@ -1317,7 +1317,7 @@ test('a late subagent_stop cannot rewrite an already-finalized sub-agent', (t) =
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 9000});
 
 	// The measured 4200 is what both the line and the cache figure are built from.
-	assert.equal(subagentLine(fake), '  subagents 4.2k tok  ⛁ ≥50% cached · 1 run');
+	assert.equal(subagentLine(fake), 'sub 4.2k tok  ⛁ ≥50% cached · 1 run');
 	assert.match(report(fake), /4\.2k tok/);
 
 	const records = subagentRecords();
@@ -1338,6 +1338,6 @@ test('a trailer that arrives after the run-end sweep never reaches the report', 
 	// The agent tool call completes late, carrying a trailer the record will never have.
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
 
-	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentLine(fake), 'sub 4.2k tok · 1 run');
 	assert.equal(subagentRecords()[0].totalTokens, undefined);
 });

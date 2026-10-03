@@ -30,16 +30,16 @@ Either way, restart Command Code or run `/reload`.
 ▲ 128k  ▼ 12.3k  ⚡ 41 tok/s  ⛁ 78% cached  ctx 128k/1M (13%)
 ```
 
-**`/token-stats`** shows the current session, plus a sub-agent line once one has been counted:
+**`/token-stats`** shows the current session on one line, with an inline sub-agent cluster once
+one has been counted:
 
 ```
-  session   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached
-  subagents 4.2k tok  ⛁ ≥25% cached · 1 run
+▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  sub 4.2k tok  ⛁ ≥25% cached · 1 run
 ```
 
-The `subagents` line is omitted until a sub-agent is finalized, and its `⛁ ≥…` cluster is
+The `·  sub …` cluster is omitted until a sub-agent is finalized, and its `⛁ ≥…` part is
 withheld unless the reading holds for every run shown (see below). Before the session's first
-model call the command answers with a single line instead:
+model call the command answers with a notice instead:
 
 ```
 no requests recorded yet this session
@@ -110,7 +110,7 @@ The file is re-read when it changes, so edits land without a reload.
 
 | Command | What it does |
 |---|---|
-| `/token-stats` | Current session totals, plus a sub-agent line when one has been counted. |
+| `/token-stats` | Current session totals, with an inline sub-agent cluster when one has been counted. |
 | `/token-stats reset` | Ask to confirm, then clear the lifetime totals. |
 
 ## How the numbers are counted
@@ -132,7 +132,7 @@ The file is re-read when it changes, so edits land without a reload.
   cluster is added only when every finalized sub-agent carries a parsed `<usage>` trailer with a
   known `total_tokens` *and* no request this session wrote to the cache; the `≥` marks a bound —
   `cached = Σ max(0, total_tokens − tokensUsed)`, so the true hit rate is at least
-  `cached / tokensUsed`. No `⚡` rate appears on the sub-agent line: the harness exposes neither a
+  `cached / tokensUsed`. No `⚡` rate appears in the sub-agent cluster: the harness exposes neither a
   sub-agent's output tokens nor its generation time. A `subagent_stop` that reports
   `tokensUsed === 0` never counts, and a background sub-agent counts only when its non-zero stop
   lands; `subagent_progress` carries an estimate and is never summed.
