@@ -52,6 +52,9 @@ interface Lifetime extends Totals {
 	// Total generation wall-clock across every run, so /token-stats can report an all-time
 	// tokens/second without re-reading the log.
 	genMs: number;
+	// Output tokens covered by `genMs`. Excludes pre-`genMs` history, so the all-time rate is
+	// never computed against an untracked denominator.
+	genOutput: number;
 	since: string;
 }
 
@@ -630,6 +633,7 @@ export default function (cmd: ModApi): void {
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
 			genMs: num(prior.genMs) + genMs,
+			genOutput: num(prior.genOutput) + run.totals.output,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
 
@@ -869,12 +873,13 @@ export default function (cmd: ModApi): void {
 		return `${label.padEnd(11)}${value}`;
 	}
 
-	// The all-time line: durable totals across every session, with an all-time tok/s read off
-	// the accumulated output and generation time.
+	// The all-time line: durable totals across every session, with a rate over the output and
+	// generation time the mod actually tracked. A legacy state file has an all-time `output` but
+	// no timed runs, so the rate is unavailable — the segment is omitted, not printed as zero.
 	function lifetimeLine(lifetime: Partial<Lifetime>): string {
 		const output = num(lifetime.output);
 		const genMs = num(lifetime.genMs);
-		const rate = genMs > 0 ? (output / genMs) * 1000 : 0;
-		return `▲ ${formatTokens(num(lifetime.input))} in  ▼ ${formatTokens(output)} out  ⚡ ${formatRate(rate)} tok/s  ⛁ ${percent(num(lifetime.cacheRead), num(lifetime.input))}% cached  ·  ${plural(num(lifetime.runs), 'run')}`;
+		const rate = genMs > 0 ? `  ⚡ ${formatRate((num(lifetime.genOutput) / genMs) * 1000)} tok/s` : '';
+		return `▲ ${formatTokens(num(lifetime.input))} in  ▼ ${formatTokens(output)} out${rate}  ⛁ ${percent(num(lifetime.cacheRead), num(lifetime.input))}% cached  ·  ${plural(num(lifetime.runs), 'run')}`;
 	}
 }

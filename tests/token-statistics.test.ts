@@ -1141,6 +1141,45 @@ test('/token-stats prints the lifetime line, with no session, models or log rows
 	assert.equal(message, 'lifetime   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  1 run');
 });
 
+// Regression: a state file written before `genMs` existed has an all-time `output` but no
+// generation time to divide it by. The rate is unavailable, not zero, so the segment is
+// omitted rather than printing `⚡ 0 tok/s` across millions of tokens.
+test('/token-stats omits the tok/s segment for a legacy lifetime with no timed runs', () => {
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 69_400, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12},
+		}),
+	);
+
+	const message = report(setup());
+	assert.match(message, /▲ 4M in  ▼ 69\.4k out/);
+	assert.doesNotMatch(message, /tok\/s/);
+});
+
+// Regression: legacy history carries no `genMs`, so a new run's rate must be measured over
+// the output that run actually timed (`genOutput`), not all-time output over the post-upgrade
+// generation time — which would inflate 100 tok/s to ~1M here.
+test('/token-stats measures the rate over the output the timed runs actually cover', async (t) => {
+	useFakeTimers(t);
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 1_000_000, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12},
+		}),
+	);
+
+	const fake = setup();
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 100), 1000);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	// 100 output tokens over 1000ms is 100 tok/s — not the all-time 1M against 1s.
+	assert.match(report(fake), /⚡ 100 tok\/s/);
+});
+
 test('/token-stats adds a subagents line once a sub-agent has been counted', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();

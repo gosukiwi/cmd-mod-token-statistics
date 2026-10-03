@@ -1,7 +1,7 @@
 # token-statistics
 
 A [Command Code](https://commandcode.ai/docs/mods) mod that meters tokens — input, output,
-cache reads/writes, cache-hit rate, tokens per second and context usage — with a live footer
+cache reads/writes, cache-hit rate and tokens per second — with a live footer
 segment and a durable log that accumulates across sessions and over months.
 
 ## Install
@@ -87,7 +87,7 @@ Settings live in `~/.commandcode/token-statistics.json` alongside the aggregates
   "status": true,
   "summary": false,
   "log": true,
-  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0, "genMs": 0 }
+  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0, "genMs": 0, "genOutput": 0 }
 }
 ```
 
@@ -122,9 +122,11 @@ The file is re-read when it changes, so edits land without a reload.
   `model_request_start` / `model_request_end`), so it measures generation speed, not tool time.
 - **Lifetime totals** live in a small JSON file; the per-run history lives in the append-only
   JSONL. Both are global — shared across every project — and accumulate over months. The lifetime
-  aggregates are the first line of `/token-stats`: its `⚡` is the all-time average, output tokens
-  divided by the accumulated generation time (`genMs`). Each run record keeps its `cwd`, so
-  per-project grouping is possible later.
+  aggregates are the first line of `/token-stats`: its `⚡` is the average output tokens/second over
+  the runs the mod has timed — the output those runs produced (`genOutput`) divided by their
+  accumulated generation time (`genMs`). History from before timing existed carries no `genMs`, so
+  it cannot back that average and the `⚡` segment is omitted until the first timed run. Each run
+  record keeps its `cwd`, so per-project grouping is possible later.
 - **Sub-agents** are reported for information only — `subagentTokens` is their input + output
   (cache reads/writes included), never folded into the session or `lifetime` totals: a nested run
   reports its own usage, which may already be included in the parent's. The footer and
