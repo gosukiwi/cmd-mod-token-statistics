@@ -109,6 +109,10 @@ interface SubagentRun {
 	tokensUsed: number;
 	trailer: SubagentTrailer | undefined;
 	finalized: boolean;
+	// The run epoch this entry was launched in. A background sub-agent outlives the run that
+	// launched it, so its finalize must be attributed to that run — not to whichever run
+	// happens to be in flight when it stops.
+	runNumber: number;
 }
 
 interface RunRecord {
@@ -325,6 +329,10 @@ export default function (cmd: ModApi): void {
 	let subagentTokens = 0;
 	let runSubagentRuns = 0;
 	let runSubagentTokens = 0;
+	// A run epoch, bumped on every run_start. A sub-agent records the epoch it launched in,
+	// so its finalize can tell whether the launching run is still the active one — a
+	// background sub-agent's stop may arrive during a later run.
+	let runNumber = 0;
 
 	// Whether any request this session wrote to the prompt cache. Session-scoped, like the
 	// sub-agent counters above, and one of the two conditions guarding the cache figure.
@@ -491,12 +499,14 @@ export default function (cmd: ModApi): void {
 		subagentTokens = 0;
 		runSubagentRuns = 0;
 		runSubagentTokens = 0;
+		runNumber = 0;
 		sawCacheWrite = false;
 	}
 
 	// Look up (or open) the ledger entry for a tool call id. A stop or a completion can
 	// arrive without its start; the entry is still harmless — it only ever counts once it
-	// has both a token count and a completion signal.
+	// has both a token count and a completion signal. An entry opened lazily this way is
+	// attributed to the current run.
 	function subagentEntry(toolCallId: string, subagentType?: string): SubagentRun {
 		let entry = subagentLedger.get(toolCallId);
 		if (entry === undefined) {
@@ -508,6 +518,7 @@ export default function (cmd: ModApi): void {
 				tokensUsed: 0,
 				trailer: undefined,
 				finalized: false,
+				runNumber,
 			};
 			subagentLedger.set(toolCallId, entry);
 		}
@@ -526,14 +537,19 @@ export default function (cmd: ModApi): void {
 	}
 
 	// Book the entry into the session and run accumulators. Idempotent: `finalized` latches
-	// on the first call, so every later path is a no-op.
+	// on the first call, so every later path is a no-op. The session totals and the entry's
+	// own durable record always count; the run-scoped counters only when the run that
+	// launched the sub-agent is still the active one, so a stop that lands during a later run
+	// (a background sub-agent outliving its run) can never be attributed to it.
 	function commitSubagent(entry: SubagentRun): void {
 		if (entry.finalized) return;
 		entry.finalized = true;
 		subagentRuns += 1;
 		subagentTokens += entry.tokensUsed;
-		runSubagentRuns += 1;
-		runSubagentTokens += entry.tokensUsed;
+		if (entry.runNumber === runNumber) {
+			runSubagentRuns += 1;
+			runSubagentTokens += entry.tokensUsed;
+		}
 
 		writeSubagentRecord(entry);
 	}
@@ -694,6 +710,9 @@ export default function (cmd: ModApi): void {
 		runGenMs = 0;
 		runSubagentRuns = 0;
 		runSubagentTokens = 0;
+		// A new epoch: any sub-agent still in flight from a previous run is now stale and
+		// must not be attributed to this one.
+		runNumber += 1;
 		reportedRunEnd = false;
 		if (typeof id === 'string') sessionId = id;
 	});
@@ -735,6 +754,8 @@ export default function (cmd: ModApi): void {
 	cmd.on('subagent_start', ({toolCallId, subagentType, background} = {}) => {
 		if (typeof toolCallId !== 'string') return;
 		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
+		// The run the sub-agent was launched in, for attribution when it finalizes.
+		entry.runNumber = runNumber;
 		// A background sub-agent outlives the tool call that launched it, so its stop is
 		// already its completion signal.
 		entry.background = background === true;

@@ -646,6 +646,80 @@ test('the per-run sub-agent count does not leak into the next run', async (t) =>
 	assert.equal(lines[1].subagentTokens, 0);
 });
 
+// A sub-agent belongs to the run that *started* it, not the run that happens to be in
+// flight when it finalizes. A background sub-agent outlives the tool call that launched it,
+// so its stop can land in a later run, or while the session is idle.
+
+test('a background sub-agent that finishes within its launching run lands in that run', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	// Launch and finish the background sub-agent while run 1 is still active.
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 4200});
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const record = runRecords()[0];
+	assert.equal(record.subagents, 1);
+	assert.equal(record.subagentTokens, 4200);
+});
+
+test('a background sub-agent that outlives its run is never claimed by a later run', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	// Run 1 ends before the background sub-agent finishes, so the sweep has no token count
+	// to book: run 1 reports no sub-agent.
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	// Run 2 starts — it never launched this sub-agent.
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	// The background sub-agent finally stops, during run 2.
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 4200});
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const lines = runRecords();
+	assert.equal(lines.length, 2);
+	assert.equal(lines[0].subagents, 0);
+	assert.equal(lines[0].subagentTokens, 0);
+	// The fix: run 2 must not claim a sub-agent it never launched.
+	assert.equal(lines[1].subagents, 0);
+	assert.equal(lines[1].subagentTokens, 0);
+
+	// The session view and the per-sub-agent record still account for it.
+	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentRecords().length, 1);
+});
+
+test('a background sub-agent that stops while the session is idle is written to no run', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	// The stop arrives with no run in flight.
+	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 4200});
+
+	// Only run 1's record was written, and it does not include the late sub-agent.
+	const lines = runRecords();
+	assert.equal(lines.length, 1);
+	assert.equal(lines[0].subagents, 0);
+	assert.equal(lines[0].subagentTokens, 0);
+
+	// The session line and the durable per-sub-agent record still account for it.
+	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentRecords().length, 1);
+});
+
 test('subagent_progress is never subscribed or summed', (t) => {
 	useFakeTimers(t);
 	const fake = setup();
