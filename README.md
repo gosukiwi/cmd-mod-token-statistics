@@ -39,8 +39,11 @@ has been counted:
 
 ```
 lifetime   ▲ 3.9M in  ▼ 69.4k out  ⚡ 87 tok/s  ⛁ 96% cached  ·  12 runs
-subagents  16.1M tok  ⛁ ≥88% cached · 12 runs
+subagents  16.1M tok  ⛁ ≥88% cached · 5 runs
 ```
+
+The `lifetime` row is all-time, across every session; the `subagents` row covers the current
+session only.
 
 Before anything has been recorded it answers with a notice instead:
 
@@ -87,7 +90,7 @@ Settings live in `~/.commandcode/token-statistics.json` alongside the aggregates
   "status": true,
   "summary": false,
   "log": true,
-  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0, "genMs": 0, "genOutput": 0 }
+  "lifetime": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "requests": 0, "runs": 0 }
 }
 ```
 
@@ -123,10 +126,12 @@ The file is re-read when it changes, so edits land without a reload.
 - **Lifetime totals** live in a small JSON file; the per-run history lives in the append-only
   JSONL. Both are global — shared across every project — and accumulate over months. The lifetime
   aggregates are the first line of `/token-stats`: its `⚡` is the average output tokens/second over
-  the runs the mod has timed — the output those runs produced (`genOutput`) divided by their
-  accumulated generation time (`genMs`). History from before timing existed carries no `genMs`, so
-  it cannot back that average and the `⚡` segment is omitted until the first timed run. Each run
-  record keeps its `cwd`, so per-project grouping is possible later.
+  the runs the mod has *timed* — the output those runs produced (`timed.output`) divided by their
+  accumulated generation time (`timed.genMs`). The pair is recorded only for a run with a real
+  `model_request_end`, so a run recovered from the `result.usage` fallback never contributes and
+  its whole wall clock never pollutes the denominator. History from before timing existed carries
+  no `timed` pair at all, so it cannot back that average and the `⚡` segment is omitted until the
+  first timed run. Each run record keeps its `cwd`, so per-project grouping is possible later.
 - **Sub-agents** are reported for information only — `subagentTokens` is their input + output
   (cache reads/writes included), never folded into the session or `lifetime` totals: a nested run
   reports its own usage, which may already be included in the parent's. The footer and

@@ -49,13 +49,10 @@ interface Totals {
 
 interface Lifetime extends Totals {
 	runs: number;
-	// Total generation wall-clock across every run, so /token-stats can report an all-time
-	// tokens/second without re-reading the log.
-	genMs: number;
-	// Output tokens covered by `genMs`. Excludes pre-`genMs` history, so the all-time rate is
-	// never computed against an untracked denominator.
-	genOutput: number;
 	since: string;
+	// Generation time and the output it covers, recorded only for runs the mod actually timed.
+	// Absent until the first timed run, which is what makes the rate unavailable rather than zero.
+	timed?: {genMs: number; output: number};
 }
 
 interface Settings {
@@ -442,10 +439,18 @@ export default function (cmd: ModApi): void {
 		return rates.count > 0 ? rates.sum / rates.count : 0;
 	}
 
+	// The `▲ in ▼ out … ⛁ cached` core shared by the footer and the lifetime line. `rate` is the
+	// caller's optional `⚡ … tok/s` segment (leading two spaces) or ''. The cache segment is
+	// omitted when there is no input to take a share of.
+	function metricsLine(input: number, output: number, cacheRead: number, rate: string): string {
+		const cache = input > 0 ? `  ⛁ ${percent(cacheRead, input)}% cached` : '';
+		return `▲ ${formatTokens(input)} in  ▼ ${formatTokens(output)} out${rate}${cache}`;
+	}
+
 	// The live footer: the session totals, with the sub-agent cluster appended once one has
 	// been counted. A session with no sub-agents stays a single segment.
 	function footerText(): string {
-		let line = `▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`;
+		let line = metricsLine(session.input, session.output, session.cacheRead, `  ⚡ ${formatRate(averageRate())} tok/s`);
 		if (subagentRuns > 0) line += `  ·  sub ${subagentTail()}`;
 		return line;
 	}
@@ -618,12 +623,16 @@ export default function (cmd: ModApi): void {
 	}
 
 	// Fold the finished run into the durable aggregates. The per-run log line is written
-	// separately (appendLog), so this only touches the small JSON. `genMs` is the run's
-	// effective generation time (see finalizeRun), accumulated so /token-stats can report an
-	// all-time rate.
-	function foldLifetime(genMs: number): void {
+	// separately (appendLog), so this only touches the small JSON. Only a run the mod actually
+	// timed (`run.genMs > 0`) may move the rate: an untimed fallback run still folds its tokens
+	// into the totals, but never into the generation-time denominator.
+	function foldLifetime(): void {
 		const file = readConfigFile();
 		const prior = file.lifetime ?? {};
+		const timed =
+			run.genMs > 0
+				? {genMs: num(prior.timed?.genMs) + run.genMs, output: num(prior.timed?.output) + run.totals.output}
+				: prior.timed;
 		const lifetime: Lifetime = {
 			input: num(prior.input) + run.totals.input,
 			output: num(prior.output) + run.totals.output,
@@ -632,11 +641,9 @@ export default function (cmd: ModApi): void {
 			requests: num(prior.requests) + run.totals.requests,
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
-			// Only carry a prior `genMs` when its paired `genOutput` exists: an earlier version
-			// wrote a lone `genMs`, which is not backed by tracked output and must be dropped
-			// rather than kept in the denominator.
-			genMs: (num(prior.genOutput) > 0 ? num(prior.genMs) : 0) + genMs,
-			genOutput: num(prior.genOutput) + run.totals.output,
+			// An untimed run leaves the prior pair untouched; a `timed` of undefined is dropped
+			// by JSON.stringify, so the key is simply absent.
+			timed,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
 
@@ -712,7 +719,7 @@ export default function (cmd: ModApi): void {
 				}
 			}
 			try {
-				foldLifetime(genMs);
+				foldLifetime();
 			} catch (error) {
 				warnWriteFailure(error);
 			}
@@ -880,14 +887,11 @@ export default function (cmd: ModApi): void {
 	// generation time the mod actually tracked. A legacy state file has an all-time `output` but
 	// no timed runs, so the rate is unavailable — the segment is omitted, not printed as zero.
 	function lifetimeLine(lifetime: Partial<Lifetime>): string {
-		const output = num(lifetime.output);
-		const genMs = num(lifetime.genMs);
-		// The rate needs both a denominator and the output it covers; a lone `genMs` (no
-		// tracked `genOutput`) is unavailable, not zero, so the segment is omitted.
-		const rate =
-			genMs > 0 && num(lifetime.genOutput) > 0
-				? `  ⚡ ${formatRate((num(lifetime.genOutput) / genMs) * 1000)} tok/s`
-				: '';
-		return `▲ ${formatTokens(num(lifetime.input))} in  ▼ ${formatTokens(output)} out${rate}  ⛁ ${percent(num(lifetime.cacheRead), num(lifetime.input))}% cached  ·  ${plural(num(lifetime.runs), 'run')}`;
+		const timed = lifetime.timed;
+		// The rate needs both a denominator and the output it covers; a state file with no timed
+		// runs (or a timed pair with no output) leaves it unavailable, not zero, so the segment is
+		// omitted.
+		const rate = timed && timed.output > 0 ? `  ⚡ ${formatRate((timed.output / timed.genMs) * 1000)} tok/s` : '';
+		return `${metricsLine(num(lifetime.input), num(lifetime.output), num(lifetime.cacheRead), rate)}  ·  ${plural(num(lifetime.runs), 'run')}`;
 	}
 }
