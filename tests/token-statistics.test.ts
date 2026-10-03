@@ -233,8 +233,22 @@ test('the footer shows session totals, cache hit rate and tok/s', (t) => {
 	assert.match(line, /▼ 38 out/);
 	assert.match(line, /62% cached/);
 	assert.match(line, /38 tok\/s/);
-	// The context segment is gone; the footer is the session totals plus the sub-agent cluster.
-	assert.doesNotMatch(line, /ctx/);
+	// Context used is the last request's prompt size, as a raw count with no window share.
+	assert.match(line, /ctx 20k(?!\/)/);
+});
+
+test('the footer tracks context used as a raw count with no window share', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	modelCall(fake, t, 'a-model-with-no-known-window', usage(12_000, 5), 1000);
+	// A raw count, never a `ctx N/total (P%)` — the mod knows no window to divide by.
+	assert.match(statusLine(fake), /ctx 12k(?!\/)/);
+	assert.doesNotMatch(statusLine(fake), /ctx 12k\/\d/);
+
+	// It follows the latest request.
+	modelCall(fake, t, 'a-model-with-no-known-window', usage(30_000, 5), 1000);
+	assert.match(statusLine(fake), /ctx 30k(?!\/)/);
 });
 
 test('tok/s is measured from the request wall-clock', (t) => {
@@ -261,7 +275,7 @@ test('the footer omits the sub-agent cluster until one has been counted', (t) =>
 	finishAgentCall(fake, 'call-1');
 
 	// The finalize repaints the footer even with no further model call.
-	assert.equal(statusLine(fake), '▲ 100 in  ▼ 10 out  ⚡ 100 tok/s  ⛁ 0% cached  ·  sub 4.2k tok · 1 run');
+	assert.equal(statusLine(fake), '▲ 100 in  ▼ 10 out  ⚡ 100 tok/s  ⛁ 0% cached  ctx 100  ·  sub 4.2k tok · 1 run');
 });
 
 test('no footer is written when the host has no status surface', (t) => {

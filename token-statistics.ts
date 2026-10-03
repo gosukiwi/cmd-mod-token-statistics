@@ -24,7 +24,7 @@
 // small (aggregates only) so it reads fast for the footer and /token-stats.
 //
 // Surfaces:
-//   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, and sub-agent usage
+//   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, context used and sub-agents
 //   • /token-stats                     — lifetime totals, plus a sub-agent summary line
 //   • a per-run feed row (opt-in via the "summary" setting)
 //
@@ -317,6 +317,10 @@ export default function (cmd: ModApi): void {
 	let requestModel: string | undefined;
 	const rates = {sum: 0, count: 0, min: 0, max: 0};
 
+	// Context used: the prompt size of the most recent request. Shown as a raw count — the mod
+	// carries no model→window table, so it never claims a share of a window it does not know.
+	let lastContextTokens = 0;
+
 	// Sub-agents are informational — nested runs report their own token totals, which may or
 	// may not already be folded into the parent's usage. Never summed into the session or
 	// lifetime totals, only shown.
@@ -447,10 +451,12 @@ export default function (cmd: ModApi): void {
 		return `▲ ${formatTokens(input)} in  ▼ ${formatTokens(output)} out${rate}${cache}`;
 	}
 
-	// The live footer: the session totals, with the sub-agent cluster appended once one has
-	// been counted. A session with no sub-agents stays a single segment.
+	// The live footer: the session totals, then the context the last request used, with the
+	// sub-agent cluster appended once one has been counted. A session with no sub-agents stays a
+	// single segment, and the context segment is omitted until a request has been measured.
 	function footerText(): string {
 		let line = metricsLine(session.input, session.output, session.cacheRead, `  ⚡ ${formatRate(averageRate())} tok/s`);
+		if (lastContextTokens > 0) line += `  ctx ${formatTokens(lastContextTokens)}`;
 		if (subagentRuns > 0) line += `  ·  sub ${subagentTail()}`;
 		return line;
 	}
@@ -475,6 +481,7 @@ export default function (cmd: ModApi): void {
 		rates.count = 0;
 		rates.min = 0;
 		rates.max = 0;
+		lastContextTokens = 0;
 		subagentLedger = new Map();
 		subagentRuns = 0;
 		subagentTokens = 0;
@@ -764,6 +771,8 @@ export default function (cmd: ModApi): void {
 			rates.min = rates.count === 1 ? rate : Math.min(rates.min, rate);
 			rates.max = Math.max(rates.max, rate);
 		}
+
+		if (parsed.input > 0) lastContextTokens = parsed.input;
 
 		refreshStatus();
 	});

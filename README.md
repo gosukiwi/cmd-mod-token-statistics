@@ -25,12 +25,15 @@ Either way, restart Command Code or run `/reload`.
 ## What you get
 
 **A footer segment** under the input, updating after every model call. It carries the session
-totals, and — once a sub-agent has been counted — the sub-agent cluster:
+totals and the context used by the last request, and — once a sub-agent has been counted — the
+sub-agent cluster:
 
 ```
-▲ 128k in  ▼ 12.3k out  ⚡ 41 tok/s  ⛁ 78% cached  ·  sub 4.2k tok  ⛁ ≥25% cached · 1 run
+▲ 128k in  ▼ 12.3k out  ⚡ 41 tok/s  ⛁ 78% cached  ctx 128.4k  ·  sub 4.2k tok  ⛁ ≥25% cached · 1 run
 ```
 
+The `ctx …` segment is omitted until a request has been measured, and appears as a raw count —
+the mod carries no model→window table, so it never reports a share of a window it does not know.
 The `·  sub …` cluster is omitted until a sub-agent is finalized, and its `⛁ ≥…` part is
 withheld unless the reading holds for every run shown (see below).
 
@@ -78,6 +81,7 @@ footer and `/token-stats` stay fast however long you have been running.
 | `▼ 12.3k out` | output (completion) tokens |
 | `⚡ 41 tok/s` | average output tokens/second over the session's model calls |
 | `⛁ 78% cached` | share of input tokens served from the prompt cache (`cacheRead / input`) |
+| `ctx 128.4k` | context used by the most recent request — its prompt size, as a raw count |
 | `·  sub 4.2k tok` | summed input + output of the finalized sub-agents (informational) |
 | `⛁ ≥25% cached` | lower bound on the sub-agents' cache-hit rate (see below) |
 
