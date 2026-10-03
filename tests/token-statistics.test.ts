@@ -1180,6 +1180,45 @@ test('/token-stats measures the rate over the output the timed runs actually cov
 	assert.match(report(fake), /⚡ 100 tok\/s/);
 });
 
+// Regression: an earlier version wrote `genMs` without its paired `genOutput`, so a real
+// state file can hold a lone `genMs`. Against a copy that does not exist the rate is
+// unavailable, not zero — the segment is omitted rather than printing `⚡ 0 tok/s`.
+test('/token-stats omits the tok/s segment for a state file with a lone genMs', () => {
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 69_400, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12, genMs: 500_000},
+		}),
+	);
+
+	const message = report(setup());
+	assert.match(message, /▲ 4M in  ▼ 69\.4k out/);
+	assert.doesNotMatch(message, /tok\/s/);
+});
+
+// Regression: a lone `genMs` is not backed by tracked output, so it must be dropped rather
+// than kept in the denominator — otherwise the next timed run's 100 tok/s reads as ~0.2.
+test('/token-stats drops a lone genMs from the rate denominator', async (t) => {
+	useFakeTimers(t);
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 69_400, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12, genMs: 500_000},
+		}),
+	);
+
+	const fake = setup();
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 100), 1000);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const message = report(fake);
+	assert.match(message, /⚡ 100 tok\/s/);
+	assert.doesNotMatch(message, /0\.2 tok\/s/);
+});
+
 test('/token-stats adds a subagents line once a sub-agent has been counted', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();

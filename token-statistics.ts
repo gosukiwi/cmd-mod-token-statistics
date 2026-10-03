@@ -632,7 +632,10 @@ export default function (cmd: ModApi): void {
 			requests: num(prior.requests) + run.totals.requests,
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
-			genMs: num(prior.genMs) + genMs,
+			// Only carry a prior `genMs` when its paired `genOutput` exists: an earlier version
+			// wrote a lone `genMs`, which is not backed by tracked output and must be dropped
+			// rather than kept in the denominator.
+			genMs: (num(prior.genOutput) > 0 ? num(prior.genMs) : 0) + genMs,
 			genOutput: num(prior.genOutput) + run.totals.output,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
@@ -879,7 +882,12 @@ export default function (cmd: ModApi): void {
 	function lifetimeLine(lifetime: Partial<Lifetime>): string {
 		const output = num(lifetime.output);
 		const genMs = num(lifetime.genMs);
-		const rate = genMs > 0 ? `  ⚡ ${formatRate((num(lifetime.genOutput) / genMs) * 1000)} tok/s` : '';
+		// The rate needs both a denominator and the output it covers; a lone `genMs` (no
+		// tracked `genOutput`) is unavailable, not zero, so the segment is omitted.
+		const rate =
+			genMs > 0 && num(lifetime.genOutput) > 0
+				? `  ⚡ ${formatRate((num(lifetime.genOutput) / genMs) * 1000)} tok/s`
+				: '';
 		return `▲ ${formatTokens(num(lifetime.input))} in  ▼ ${formatTokens(output)} out${rate}  ⛁ ${percent(num(lifetime.cacheRead), num(lifetime.input))}% cached  ·  ${plural(num(lifetime.runs), 'run')}`;
 	}
 }
