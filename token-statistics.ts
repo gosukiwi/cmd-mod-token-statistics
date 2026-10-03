@@ -24,8 +24,8 @@
 // small (aggregates only) so it reads fast for the footer and /token-stats.
 //
 // Surfaces:
-//   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, context usage
-//   • /token-stats                     — session totals plus sub-agent usage (at most two lines)
+//   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, context used and sub-agents
+//   • /token-stats                     — lifetime totals, plus a sub-agent summary line
 //   • a per-run feed row (opt-in via the "summary" setting)
 //
 // Headless (`cmd -p`) renders no footer and drops feed rows, but the log still writes —
@@ -39,21 +39,6 @@ import type {ModApi} from '@commandcode/harness';
 const CONFIG_PATH = join(homedir(), '.commandcode', 'token-statistics.json');
 const LOG_PATH = join(homedir(), '.commandcode', 'token-statistics.log.jsonl');
 
-// Context-window sizes, keyed by the model id the harness reports. Only used to turn the
-// last request's prompt size into a percentage; an unknown model degrades to a raw token
-// count. Seeded from Command Code's model catalog (models.md) — refresh occasionally.
-const CONTEXT_WINDOWS: Record<string, number> = {
-	'claude-sonnet-5': 1_000_000,
-	'claude-sonnet-4-6': 1_000_000,
-	'claude-opus-5-5': 1_000_000,
-	'claude-opus-5': 1_000_000,
-	'claude-opus-4-8': 1_000_000,
-	'claude-opus-4-7': 1_000_000,
-	'claude-fable-5-1': 1_000_000,
-	'claude-fable-5': 1_000_000,
-	'claude-haiku-4-5-20251001': 200_000,
-};
-
 interface Totals {
 	input: number;
 	output: number;
@@ -65,20 +50,21 @@ interface Totals {
 interface Lifetime extends Totals {
 	runs: number;
 	since: string;
+	// Generation time and the output it covers, recorded only for runs the mod actually timed.
+	// Absent until the first timed run, which is what makes the rate unavailable rather than zero.
+	timed?: {genMs: number; output: number};
 }
 
 interface Settings {
 	readonly status: boolean;
 	readonly summary: boolean;
 	readonly log: boolean;
-	readonly contextInStatus: boolean;
 }
 
 interface StateFile {
 	readonly status?: boolean;
 	readonly summary?: boolean;
 	readonly log?: boolean;
-	readonly contextInStatus?: boolean;
 	readonly lifetime?: Partial<Lifetime>;
 }
 
@@ -316,10 +302,6 @@ export default function (cmd: ModApi): void {
 		type: 'boolean',
 		description: 'Append a per-run record to the durable log.',
 	});
-	cmd.addFlag('token-stats-context', {
-		type: 'boolean',
-		description: 'Include context-window usage in the footer.',
-	});
 
 	// Session-scoped state. This is volatile on purpose: the durable totals live in the
 	// state file, and the session view is what the footer shows.
@@ -335,9 +317,9 @@ export default function (cmd: ModApi): void {
 	let requestModel: string | undefined;
 	const rates = {sum: 0, count: 0, min: 0, max: 0};
 
-	// Context usage proxy: the prompt size of the most recent request.
+	// Context used: the prompt size of the most recent request. Shown as a raw count — the mod
+	// carries no model→window table, so it never claims a share of a window it does not know.
 	let lastContextTokens = 0;
-	let lastContextModel: string | undefined;
 
 	// Sub-agents are informational — nested runs report their own token totals, which may or
 	// may not already be folded into the parent's usage. Never summed into the session or
@@ -400,12 +382,10 @@ export default function (cmd: ModApi): void {
 		const status = cmd.getFlag('token-stats-status');
 		const summary = cmd.getFlag('token-stats-summary');
 		const log = cmd.getFlag('token-stats-log');
-		const context = cmd.getFlag('token-stats-context');
 		return {
 			status: typeof status === 'boolean' ? status : file.status !== false,
 			summary: typeof summary === 'boolean' ? summary : file.summary === true,
 			log: typeof log === 'boolean' ? log : file.log !== false,
-			contextInStatus: typeof context === 'boolean' ? context : file.contextInStatus !== false,
 		};
 	}
 
@@ -463,27 +443,22 @@ export default function (cmd: ModApi): void {
 		return rates.count > 0 ? rates.sum / rates.count : 0;
 	}
 
-	function contextWindowFor(model: string | undefined): number | undefined {
-		return model === undefined ? undefined : CONTEXT_WINDOWS[model];
+	// The `▲ in ▼ out … ⛁ cached` core shared by the footer and the lifetime line. `rate` is the
+	// caller's optional `⚡ … tok/s` segment (leading two spaces) or ''. The cache segment is
+	// omitted when there is no input to take a share of.
+	function metricsLine(input: number, output: number, cacheRead: number, rate: string): string {
+		const cache = input > 0 ? `  ⛁ ${percent(cacheRead, input)}% cached` : '';
+		return `▲ ${formatTokens(input)} in  ▼ ${formatTokens(output)} out${rate}${cache}`;
 	}
 
+	// The live footer: the session totals, then the context the last request used, with the
+	// sub-agent cluster appended once one has been counted. A session with no sub-agents stays a
+	// single segment, and the context segment is omitted until a request has been measured.
 	function footerText(): string {
-		const settings = resolveSettings();
-		const parts = [
-			`▲ ${formatTokens(session.input)}`,
-			`▼ ${formatTokens(session.output)}`,
-			`⚡ ${formatRate(averageRate())} tok/s`,
-		];
-		if (session.input > 0) parts.push(`⛁ ${percent(session.cacheRead, session.input)}% cached`);
-		if (settings.contextInStatus && lastContextTokens > 0) {
-			const window = contextWindowFor(lastContextModel);
-			parts.push(
-				window === undefined
-					? `ctx ${formatTokens(lastContextTokens)}`
-					: `ctx ${formatTokens(lastContextTokens)}/${formatTokens(window)} (${percent(lastContextTokens, window)}%)`,
-			);
-		}
-		return parts.join('  ');
+		let line = metricsLine(session.input, session.output, session.cacheRead, `  ⚡ ${formatRate(averageRate())} tok/s`);
+		if (lastContextTokens > 0) line += `  ctx ${formatTokens(lastContextTokens)}`;
+		if (subagentRuns > 0) line += `  ·  sub ${subagentTail()}`;
+		return line;
 	}
 
 	function refreshStatus(): void {
@@ -507,7 +482,6 @@ export default function (cmd: ModApi): void {
 		rates.min = 0;
 		rates.max = 0;
 		lastContextTokens = 0;
-		lastContextModel = undefined;
 		subagentLedger = new Map();
 		subagentRuns = 0;
 		subagentTokens = 0;
@@ -572,6 +546,9 @@ export default function (cmd: ModApi): void {
 		subagentRuns += 1;
 		subagentTokens += entry.tokensUsed;
 		writeSubagentRecord(entry);
+		// The footer now carries the sub-agent cluster, so a finalize has to repaint it —
+		// otherwise the cluster would only appear at the next model call or run end.
+		refreshStatus();
 	}
 
 	// One durable line per finalized sub-agent, alongside the per-run lines. Gated by the
@@ -643,11 +620,26 @@ export default function (cmd: ModApi): void {
 		return documented === subagentRuns ? cached : undefined;
 	}
 
+	// The sub-agent figures shared by the footer cluster and the /token-stats subagents row:
+	// the summed token count, the optional `≥N% cached` bound, and the run count. The footer
+	// prefixes it with `sub `; the command row labels it `subagents`.
+	function subagentTail(): string {
+		const cached = subagentCacheTokens();
+		const cache = cached === undefined ? '' : `  ⛁ ≥${percent(cached, subagentTokens)}% cached`;
+		return `${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`;
+	}
+
 	// Fold the finished run into the durable aggregates. The per-run log line is written
-	// separately (appendLog), so this only touches the small JSON.
+	// separately (appendLog), so this only touches the small JSON. Only a run the mod actually
+	// timed (`run.genMs > 0`) may move the rate: an untimed fallback run still folds its tokens
+	// into the totals, but never into the generation-time denominator.
 	function foldLifetime(): void {
 		const file = readConfigFile();
 		const prior = file.lifetime ?? {};
+		const timed =
+			run.genMs > 0
+				? {genMs: num(prior.timed?.genMs) + run.genMs, output: num(prior.timed?.output) + run.totals.output}
+				: prior.timed;
 		const lifetime: Lifetime = {
 			input: num(prior.input) + run.totals.input,
 			output: num(prior.output) + run.totals.output,
@@ -656,6 +648,9 @@ export default function (cmd: ModApi): void {
 			requests: num(prior.requests) + run.totals.requests,
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
+			// An untimed run leaves the prior pair untouched; a `timed` of undefined is dropped
+			// by JSON.stringify, so the key is simply absent.
+			timed,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
 
@@ -777,10 +772,7 @@ export default function (cmd: ModApi): void {
 			rates.max = Math.max(rates.max, rate);
 		}
 
-		if (parsed.input > 0) {
-			lastContextTokens = parsed.input;
-			lastContextModel = modelId;
-		}
+		if (parsed.input > 0) lastContextTokens = parsed.input;
 
 		refreshStatus();
 	});
@@ -858,7 +850,7 @@ export default function (cmd: ModApi): void {
 
 	cmd.addCommand({
 		name: 'token-stats',
-		description: 'Session token totals and, when sub-agents ran, one combined sub-agent line',
+		description: 'Lifetime token totals, plus a sub-agent summary line when sub-agents ran',
 		handler: ({args}: {args?: unknown} = {}) => {
 			const sub = String(args ?? '').trim().toLowerCase();
 			if (sub === 'reset') {
@@ -882,19 +874,33 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
-	// One line: the session totals, plus an inline sub-agent cluster when one has been counted.
+	// Two labelled lines: the durable lifetime totals, plus a sub-agent summary row when one
+	// has been counted this session. The live session totals live in the footer instead.
 	function reportText(): string {
-		if (session.requests === 0 && session.input === 0 && session.output === 0) {
-			return 'no requests recorded yet this session';
+		const lifetime = readConfigFile().lifetime;
+		// `runs`, not `requests`: a run recovered from the harness fallback carries tokens but
+		// no request count, and it still folds into the lifetime totals.
+		if (lifetime === undefined || num(lifetime.runs) === 0) {
+			return 'no requests recorded yet';
 		}
-		let line = `▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`;
-		if (subagentRuns > 0) {
-			// The cache cluster is all-or-nothing: a `≥` bound is only worth printing when it
-			// is a bound on every run shown.
-			const cached = subagentCacheTokens();
-			const cache = cached === undefined ? '' : `  ⛁ ≥${percent(cached, subagentTokens)}% cached`;
-			line += `  ·  sub ${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`;
-		}
-		return line;
+		const lines = [row('lifetime', lifetimeLine(lifetime))];
+		if (subagentRuns > 0) lines.push(row('subagents', subagentTail()));
+		return lines.join('\n');
+	}
+
+	function row(label: string, value: string): string {
+		return `${label.padEnd(11)}${value}`;
+	}
+
+	// The all-time line: durable totals across every session, with a rate over the output and
+	// generation time the mod actually tracked. A legacy state file has an all-time `output` but
+	// no timed runs, so the rate is unavailable — the segment is omitted, not printed as zero.
+	function lifetimeLine(lifetime: Partial<Lifetime>): string {
+		const timed = lifetime.timed;
+		// The rate needs both a denominator and the output it covers; a state file with no timed
+		// runs (or a timed pair with no output) leaves it unavailable, not zero, so the segment is
+		// omitted.
+		const rate = timed && timed.output > 0 ? `  ⚡ ${formatRate((timed.output / timed.genMs) * 1000)} tok/s` : '';
+		return `${metricsLine(num(lifetime.input), num(lifetime.output), num(lifetime.cacheRead), rate)}  ·  ${plural(num(lifetime.runs), 'run')}`;
 	}
 }

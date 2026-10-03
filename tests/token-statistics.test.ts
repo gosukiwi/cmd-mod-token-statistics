@@ -180,11 +180,11 @@ function modelCall(fake: FakeMod, t: any, model: string, tokens: any, ms: number
 test('registers the flags, command, renderer and events it documents', () => {
 	const fake = setup();
 
-	for (const flag of ['token-stats-status', 'token-stats-summary', 'token-stats-log', 'token-stats-context']) {
+	for (const flag of ['token-stats-status', 'token-stats-summary', 'token-stats-log']) {
 		assert.ok(fake.declaredFlags.has(flag), `missing flag ${flag}`);
 	}
 	// The boolean flags must NOT declare a default, or a config file value could never win.
-	for (const flag of ['token-stats-status', 'token-stats-summary', 'token-stats-log', 'token-stats-context']) {
+	for (const flag of ['token-stats-status', 'token-stats-summary', 'token-stats-log']) {
 		assert.equal(fake.declaredFlags.get(flag).default, undefined);
 	}
 
@@ -229,12 +229,39 @@ test('the footer shows session totals, cache hit rate and tok/s', (t) => {
 	modelCall(fake, t, 'claude-sonnet-5', usage(20_000, 38, 12_400, 800), 1000);
 
 	const line = statusLine(fake);
-	assert.match(line, /▲ 20k/);
-	assert.match(line, /▼ 38/);
+	assert.match(line, /▲ 20k in/);
+	assert.match(line, /▼ 38 out/);
 	assert.match(line, /62% cached/);
 	assert.match(line, /38 tok\/s/);
-	// 20k of a 1M window is 2%.
-	assert.match(line, /ctx 20k\/1M \(2%\)/);
+	// Context used is the last request's prompt size, as a raw count with no window share.
+	assert.match(line, /ctx 20k(?!\/)/);
+});
+
+test('the footer tracks context used as a raw count with no window share', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	modelCall(fake, t, 'a-model-with-no-known-window', usage(12_000, 5), 1000);
+	// A raw count, never a `ctx N/total (P%)` — the mod knows no window to divide by.
+	assert.match(statusLine(fake), /ctx 12k(?!\/)/);
+	assert.doesNotMatch(statusLine(fake), /ctx 12k\/\d/);
+
+	// It follows the latest request.
+	modelCall(fake, t, 'a-model-with-no-known-window', usage(30_000, 5), 1000);
+	assert.match(statusLine(fake), /ctx 30k(?!\/)/);
+});
+
+test('the footer omits the context segment until a request has been measured', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	// No model_request_end: the run's only numbers are the harness fallback, so no context has
+	// been measured. The footer still repaints at run end.
+	await fake.hook('onRunEnd', {result: {stopReason: 'interrupted', usage: usage(300, 20)}});
+
+	assert.match(statusLine(fake), /▲ 300 in/);
+	assert.doesNotMatch(statusLine(fake), /ctx/);
 });
 
 test('tok/s is measured from the request wall-clock', (t) => {
@@ -248,13 +275,20 @@ test('tok/s is measured from the request wall-clock', (t) => {
 	assert.match(statusLine(fake), /50 tok\/s/);
 });
 
-test('an unknown model degrades to a context token count with no percentage', (t) => {
+test('the footer omits the sub-agent cluster until one has been counted', (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
-	modelCall(fake, t, 'some-new-model', usage(20_000, 5), 1000);
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
 
-	assert.match(statusLine(fake), /ctx 20k(?!\/)/);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCall(fake, 'call-1');
+
+	// The finalize repaints the footer even with no further model call.
+	assert.equal(statusLine(fake), '▲ 100 in  ▼ 10 out  ⚡ 100 tok/s  ⛁ 0% cached  ctx 100  ·  sub 4.2k tok · 1 run');
 });
 
 test('no footer is written when the host has no status surface', (t) => {
@@ -402,7 +436,7 @@ test('tokens that only arrived via the run fallback are visible in the report', 
 	await fake.hook('onRunEnd', {result: {stopReason: 'interrupted', usage: usage(300, 20)}});
 
 	const message = report(fake);
-	assert.notEqual(message, 'no requests recorded yet this session');
+	assert.notEqual(message, 'no requests recorded yet');
 	assert.match(message, /▲ 300 in/);
 	assert.match(message, /▼ 20 out/);
 });
@@ -516,8 +550,8 @@ test('sub-agent tokens are shown but never folded into the totals', async (t) =>
 	assert.equal(readState().lifetime.input, 100);
 	assert.equal(readState().lifetime.output, 10);
 
-	assert.match(report(fake), /·  sub /);
-	assert.match(report(fake), /4\.2k tok · 1 run/);
+	assert.match(statusLine(fake), /·  sub /);
+	assert.match(statusLine(fake), /4\.2k tok · 1 run/);
 });
 
 test('a foreground sub-agent finalizes only when its agent tool call completes', (t) => {
@@ -529,15 +563,15 @@ test('a foreground sub-agent finalizes only when its agent tool call completes',
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 
-	assert.doesNotMatch(report(fake), /·  sub /, 'not final before the agent tool call finishes');
+	assert.doesNotMatch(statusLine(fake), /·  sub /, 'not final before the agent tool call finishes');
 
 	// Some other tool finishing must not finalize it.
 	finishAgentCall(fake, 'call-1', 'read');
-	assert.doesNotMatch(report(fake), /·  sub /);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
 
 	finishAgentCall(fake, 'call-1');
-	assert.match(report(fake), /·  sub /);
-	assert.match(report(fake), /4\.2k tok · 1 run/);
+	assert.match(statusLine(fake), /·  sub /);
+	assert.match(statusLine(fake), /4\.2k tok · 1 run/);
 });
 
 test('a background sub-agent finalizes on its stop, with no agent tool call', async (t) => {
@@ -549,8 +583,8 @@ test('a background sub-agent finalizes on its stop, with no agent tool call', as
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
 
-	assert.match(report(fake), /·  sub /);
-	assert.match(report(fake), /1k tok · 1 run/);
+	assert.match(statusLine(fake), /·  sub /);
+	assert.match(statusLine(fake), /1k tok · 1 run/);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 	const record = runRecords()[0];
@@ -573,7 +607,7 @@ test('a stop with no usable token count is ignored entirely', async (t) => {
 	finishAgentCall(fake, 'call-1');
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
-	assert.doesNotMatch(report(fake), /·  sub /);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
 	const record = runRecords()[0];
 	assert.equal(record.subagents, 0);
 	assert.equal(record.subagentTokens, 0);
@@ -589,7 +623,7 @@ test('the run-end sweep finalizes a foreground sub-agent that never completed', 
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
-	assert.doesNotMatch(report(fake), /·  sub /);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
 
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
@@ -622,7 +656,7 @@ test('the run-end sweep leaves a zero-token entry untouched', async (t) => {
 	// completed, so it is not done and must not be counted: no line, no durable record.
 	stopSubagent(fake, {toolCallId: 'c1', subagentType: 'explore', tokensUsed: 5000});
 
-	assert.doesNotMatch(report(fake), /·  sub /, 'no subagents line is shown');
+	assert.doesNotMatch(statusLine(fake), /·  sub /, 'no subagents cluster is shown');
 	assert.equal(subagentLine(fake), '');
 	assert.equal(subagentRecords().length, 0, 'no kind:"subagent" record is written');
 });
@@ -683,7 +717,7 @@ test('finalization is idempotent', async (t) => {
 	const record = runRecords()[0];
 	assert.equal(record.subagents, 1);
 	assert.equal(record.subagentTokens, 4200);
-	assert.match(report(fake), /4\.2k tok · 1 run/);
+	assert.match(statusLine(fake), /4\.2k tok · 1 run/);
 });
 
 test('the per-run sub-agent count does not leak into the next run', async (t) => {
@@ -790,8 +824,8 @@ test('subagent_progress is never subscribed or summed', (t) => {
 	// The progress stream carries an estimate; it must not reach any total or counter.
 	fake.emit('subagent_progress', {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 50_000});
 
-	assert.doesNotMatch(report(fake), /·  sub /);
-	assert.match(report(fake), /▲ 100 in/);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
+	assert.match(statusLine(fake), /▲ 100 in/);
 });
 
 test('a new session starts with no sub-agent activity to report', (t) => {
@@ -802,11 +836,11 @@ test('a new session starts with no sub-agent activity to report', (t) => {
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', background: true});
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'explore', tokensUsed: 4200});
-	assert.match(report(fake), /·  sub /);
+	assert.match(statusLine(fake), /·  sub /);
 
 	fake.emit('session_start', {sessionId: 's2'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
-	assert.doesNotMatch(report(fake), /·  sub /);
+	assert.doesNotMatch(statusLine(fake), /·  sub /);
 });
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1122,7 @@ test('a failed sub-agent log write warns without crashing the finalize', async (
 	);
 	// The run still reports its own totals despite the failed log write.
 	await assert.doesNotReject(() => fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}}));
-	assert.match(report(fake), /·  sub /);
+	assert.match(statusLine(fake), /·  sub /);
 });
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +1155,7 @@ test('the per-run summary row is printed only when enabled', async (t) => {
 // /token-stats
 // ---------------------------------------------------------------------------
 
-test('/token-stats prints exactly one session line, and no lifetime, models or log rows', async (t) => {
+test('/token-stats prints the lifetime line, with no session, models or log rows', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
@@ -1130,36 +1164,86 @@ test('/token-stats prints exactly one session line, and no lifetime, models or l
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	const message = fake.commands.get('token-stats')!().message;
-	// One line, no label/header, and neither the `(N written)` nor the `· N requests` suffix.
-	assert.equal(message, '▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached');
+	// The durable lifetime totals, labelled, with the all-time run count and no sub-agent row.
+	assert.equal(message, 'lifetime   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  1 run');
 });
 
-test('/token-stats appends the sub-agent cluster once a sub-agent has been counted', async (t) => {
+// Regression: a state file written before `genMs` existed has an all-time `output` but no
+// generation time to divide it by. The rate is unavailable, not zero, so the segment is
+// omitted rather than printing `⚡ 0 tok/s` across millions of tokens.
+test('/token-stats omits the tok/s segment for a legacy lifetime with no timed runs', () => {
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 69_400, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12},
+		}),
+	);
+
+	const message = report(setup());
+	assert.match(message, /▲ 4M in  ▼ 69\.4k out/);
+	assert.doesNotMatch(message, /tok\/s/);
+});
+
+// Regression: legacy history carries no `timed` pair, so a new run's rate must be measured over
+// the output the timed runs actually cover (`timed.output`), not all-time output over the
+// post-upgrade generation time — which would inflate 100 tok/s to ~1M here.
+test('/token-stats measures the rate over the output the timed runs actually cover', async (t) => {
+	useFakeTimers(t);
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			lifetime: {input: 4_000_000, output: 1_000_000, cacheRead: 3_000_000, cacheWrite: 0, requests: 100, runs: 12},
+		}),
+	);
+
+	const fake = setup();
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 100), 1000);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	// 100 output tokens over 1000ms is 100 tok/s — not the all-time 1M against 1s.
+	assert.match(report(fake), /⚡ 100 tok\/s/);
+});
+
+// Regression: a run with no `model_request_end` uses the harness-usage fallback and carries no
+// measured generation time, so it must not enter the lifetime rate. Folding the run's whole
+// wall clock in as generation time would print a real-looking rate over time that includes
+// tool and idle time.
+test('/token-stats omits the tok/s segment for an untimed fallback run', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	t.mock.timers.tick(1000);
+	// No modelCall: the run's only numbers are the harness-reported usage.
+	await fake.hook('onRunEnd', {result: {stopReason: 'interrupted', usage: usage(300, 20)}});
+
+	assert.doesNotMatch(report(fake), /tok\/s/);
+});
+
+test('/token-stats adds a subagents line once a sub-agent has been counted', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'claude-sonnet-5', usage(20_000, 38, 12_400, 800), 1000);
-	assert.equal(
-		fake.commands.get('token-stats')!().message,
-		'▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached',
-		'no sub-agent cluster before any sub-agent is counted',
-	);
-
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 	finishAgentCall(fake, 'call-1');
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
 	assert.equal(
 		fake.commands.get('token-stats')!().message,
-		'▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  sub 4.2k tok · 1 run',
+		'lifetime   ▲ 20k in  ▼ 38 out  ⚡ 38 tok/s  ⛁ 62% cached  ·  1 run\nsubagents  4.2k tok · 1 run',
 	);
 });
 
 test('/token-stats says so when nothing has been recorded', () => {
 	const fake = setup();
 	const message = fake.commands.get('token-stats')!().message;
-	assert.equal(message, 'no requests recorded yet this session');
+	assert.equal(message, 'no requests recorded yet');
 });
 
 test('/token-stats reset clears the lifetime only after confirmation', async (t) => {
@@ -1191,10 +1275,11 @@ test('/token-stats reset clears the lifetime only after confirmation', async (t)
 // Subagent cache figure
 // ---------------------------------------------------------------------------
 
-// The inline sub-agent cluster of /token-stats, e.g. `sub 4.2k tok · 1 run`; empty when none.
+// The inline sub-agent cluster of the footer, e.g. `sub 4.2k tok · 1 run`; empty when none.
 function subagentLine(fake: FakeMod): string {
-	const at = report(fake).indexOf('·  sub ');
-	return at === -1 ? '' : report(fake).slice(at + 3);
+	const line = statusLine(fake);
+	const at = line.indexOf('·  sub ');
+	return at === -1 ? '' : line.slice(at + 3);
 }
 
 // A sub-agent whose trailer total exceeds what it spent: the difference is the prompt
@@ -1318,7 +1403,7 @@ test('a late subagent_stop cannot rewrite an already-finalized sub-agent', (t) =
 
 	// The measured 4200 is what both the line and the cache figure are built from.
 	assert.equal(subagentLine(fake), 'sub 4.2k tok  ⛁ ≥50% cached · 1 run');
-	assert.match(report(fake), /4\.2k tok/);
+	assert.match(statusLine(fake), /4\.2k tok/);
 
 	const records = subagentRecords();
 	assert.equal(records.length, 1);
