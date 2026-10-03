@@ -251,6 +251,19 @@ test('the footer tracks context used as a raw count with no window share', (t) =
 	assert.match(statusLine(fake), /ctx 30k(?!\/)/);
 });
 
+test('the footer omits the context segment until a request has been measured', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	// No model_request_end: the run's only numbers are the harness fallback, so no context has
+	// been measured. The footer still repaints at run end.
+	await fake.hook('onRunEnd', {result: {stopReason: 'interrupted', usage: usage(300, 20)}});
+
+	assert.match(statusLine(fake), /▲ 300 in/);
+	assert.doesNotMatch(statusLine(fake), /ctx/);
+});
+
 test('tok/s is measured from the request wall-clock', (t) => {
 	useFakeTimers(t);
 	const fake = setup();
