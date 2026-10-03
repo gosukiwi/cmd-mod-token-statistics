@@ -153,6 +153,34 @@ function zeros(): Totals {
 	return {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0};
 }
 
+// Run-scoped state — everything that restarts on a run_start. Bundled into one object built
+// by one factory so a future run-scoped field cannot be added to one reset site (a new
+// session) and forgotten in the other (a new run).
+interface RunState {
+	totals: Totals;
+	// The model ids seen this run, for the per-run log line. Only the ids are needed — the
+	// per-model totals were dropped along with the report's models row.
+	models: Set<string>;
+	startedAt: number | undefined;
+	genMs: number;
+	reportedEnd: boolean;
+	// A run epoch, bumped on every run_start. A sub-agent records the epoch it launched in,
+	// so its finalize can tell whether the launching run is still the active one — a
+	// background sub-agent's stop may arrive during a later run.
+	epoch: number;
+}
+
+function newRun(epoch: number, startedAt?: number): RunState {
+	return {
+		totals: zeros(),
+		models: new Set(),
+		startedAt,
+		genMs: 0,
+		reportedEnd: false,
+		epoch,
+	};
+}
+
 // Coerce anything that is not a finite number to 0 — usage fields arrive from providers
 // and can legitimately be undefined.
 function num(value: unknown): number {
@@ -298,14 +326,9 @@ export default function (cmd: ModApi): void {
 	const session = zeros();
 	let sessionId: string | undefined;
 
-	// Run-scoped state, reset on every run_start.
-	let run = zeros();
-	// The model ids seen this run, for the per-run log line. Only the ids are needed — the
-	// per-model totals were dropped along with the report's models row.
-	let runModels = new Set<string>();
-	let runStartedAt: number | undefined;
-	let runGenMs = 0;
-	let reportedRunEnd = false;
+	// Run-scoped state, built fresh by newRun on every run_start (see resetSession and the
+	// run_start handler — the two reset sites cannot drift).
+	let run = newRun(0);
 
 	// Per-request timing for the "tokens per second" figures.
 	let requestStartAt: number | undefined;
@@ -323,16 +346,10 @@ export default function (cmd: ModApi): void {
 	// The ledger is keyed by tool call id and holds every sub-agent that has started but not
 	// yet been finalized, so that a stop's token count can wait for the sub-agent to actually
 	// be done (see finalizeSubagent). subagentRuns / subagentTokens are session-wide (for the
-	// report); runSubagentRuns / runSubagentTokens are run-scoped (for the log line).
+	// report); a run's own sub-agent totals are derived from the ledger at run end.
 	let subagentLedger = new Map<string, SubagentRun>();
 	let subagentRuns = 0;
 	let subagentTokens = 0;
-	let runSubagentRuns = 0;
-	let runSubagentTokens = 0;
-	// A run epoch, bumped on every run_start. A sub-agent records the epoch it launched in,
-	// so its finalize can tell whether the launching run is still the active one — a
-	// background sub-agent's stop may arrive during a later run.
-	let runNumber = 0;
 
 	// Whether any request this session wrote to the prompt cache. Session-scoped, like the
 	// sub-agent counters above, and one of the two conditions guarding the cache figure.
@@ -481,11 +498,8 @@ export default function (cmd: ModApi): void {
 	function resetSession(): void {
 		Object.assign(session, zeros());
 		sessionId = undefined;
-		run = zeros();
-		runModels = new Set();
-		runStartedAt = undefined;
-		runGenMs = 0;
-		reportedRunEnd = false;
+		// One atomic reset of every run-scoped field; the epoch starts over for the session.
+		run = newRun(0);
 		requestStartAt = undefined;
 		requestModel = undefined;
 		rates.sum = 0;
@@ -497,9 +511,6 @@ export default function (cmd: ModApi): void {
 		subagentLedger = new Map();
 		subagentRuns = 0;
 		subagentTokens = 0;
-		runSubagentRuns = 0;
-		runSubagentTokens = 0;
-		runNumber = 0;
 		sawCacheWrite = false;
 	}
 
@@ -518,7 +529,7 @@ export default function (cmd: ModApi): void {
 				tokensUsed: 0,
 				trailer: undefined,
 				finalized: false,
-				runNumber,
+				runNumber: run.epoch,
 			};
 			subagentLedger.set(toolCallId, entry);
 		}
@@ -526,31 +537,30 @@ export default function (cmd: ModApi): void {
 		return entry;
 	}
 
+	// The one mutation point for a ledger entry: a finalized entry is immutable, so a late
+	// stop or completion can never rewrite the numbers its committed totals (and its durable
+	// record) were built from. Handlers declare only the facts they learned; the invariant
+	// lives here. The entry is opened lazily, so an event with no prior subagent_start still
+	// records what it knows.
+	function updateSubagent(toolCallId: string, patch: Partial<SubagentRun>, subagentType?: string): void {
+		const entry = subagentEntry(toolCallId, subagentType);
+		if (entry.finalized) return;
+		Object.assign(entry, patch);
+		finalizeSubagent(entry);
+	}
+
 	// A sub-agent counts exactly once, and only once its tokens are known AND it is known to
 	// be done: a background one is done when it stops, a foreground one when its `agent` tool
-	// call completes. The `finalized` flag is what makes a second stop — or the run-end sweep
-	// after a normal finalize — a no-op rather than a double count.
+	// call completes. This is the one place that books an entry into the session totals and
+	// writes its durable record; `finalized` latches on the first call, so every later path —
+	// a second stop, or the run-end sweep after a normal finalize — is a no-op rather than a
+	// double count.
 	function finalizeSubagent(entry: SubagentRun): void {
 		if (entry.finalized || entry.tokensUsed <= 0) return;
 		if (!entry.background && !entry.agentDone) return;
-		commitSubagent(entry);
-	}
-
-	// Book the entry into the session and run accumulators. Idempotent: `finalized` latches
-	// on the first call, so every later path is a no-op. The session totals and the entry's
-	// own durable record always count; the run-scoped counters only when the run that
-	// launched the sub-agent is still the active one, so a stop that lands during a later run
-	// (a background sub-agent outliving its run) can never be attributed to it.
-	function commitSubagent(entry: SubagentRun): void {
-		if (entry.finalized) return;
 		entry.finalized = true;
 		subagentRuns += 1;
 		subagentTokens += entry.tokensUsed;
-		if (entry.runNumber === runNumber) {
-			runSubagentRuns += 1;
-			runSubagentTokens += entry.tokensUsed;
-		}
-
 		writeSubagentRecord(entry);
 	}
 
@@ -586,7 +596,9 @@ export default function (cmd: ModApi): void {
 	// afterToolCall).
 	function sweepSubagents(): void {
 		for (const entry of subagentLedger.values()) {
-			if (entry.tokensUsed > 0) commitSubagent(entry);
+			// The run ending is itself a completion signal; updateSubagent keeps the
+			// finalized-immutability rule in one place and skips anything already booked.
+			updateSubagent(entry.toolCallId, {agentDone: true});
 		}
 	}
 
@@ -622,11 +634,11 @@ export default function (cmd: ModApi): void {
 		const file = readConfigFile();
 		const prior = file.lifetime ?? {};
 		const lifetime: Lifetime = {
-			input: num(prior.input) + run.input,
-			output: num(prior.output) + run.output,
-			cacheRead: num(prior.cacheRead) + run.cacheRead,
-			cacheWrite: num(prior.cacheWrite) + run.cacheWrite,
-			requests: num(prior.requests) + run.requests,
+			input: num(prior.input) + run.totals.input,
+			output: num(prior.output) + run.totals.output,
+			cacheRead: num(prior.cacheRead) + run.totals.cacheRead,
+			cacheWrite: num(prior.cacheWrite) + run.totals.cacheWrite,
+			requests: num(prior.requests) + run.totals.requests,
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
@@ -636,8 +648,8 @@ export default function (cmd: ModApi): void {
 	}
 
 	function finalizeRun(result: unknown): void {
-		if (reportedRunEnd) return;
-		reportedRunEnd = true;
+		if (run.reportedEnd) return;
+		run.reportedEnd = true;
 
 		// Anything still in the ledger holding a token count is this run's to report.
 		sweepSubagents();
@@ -648,10 +660,10 @@ export default function (cmd: ModApi): void {
 		// The run's own per-request tally is the source of truth. Fall back to the
 		// harness-reported usage only when no model_request_end was observed (an
 		// interrupted run, or a provider that does not emit it).
-		if (run.requests === 0) {
+		if (run.totals.requests === 0) {
 			const fallback = readUsage(typed.usage);
 			if (fallback.input + fallback.output > 0) {
-				addTotals(run, fallback, 0);
+				addTotals(run.totals, fallback, 0);
 				// Mirror it into the session view too. The run fallback carries no request
 				// count (it is not a real request), but the tokens are real and would
 				// otherwise be counted by the lifetime totals yet invisible to /token-stats.
@@ -659,29 +671,42 @@ export default function (cmd: ModApi): void {
 			}
 		}
 
-		const wallMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
-		const genMs = runGenMs > 0 ? runGenMs : wallMs;
-		const outputTokPerSec = genMs > 0 ? round1((run.output / genMs) * 1000) : 0;
+		const wallMs = run.startedAt === undefined ? 0 : Date.now() - run.startedAt;
+		const genMs = run.genMs > 0 ? run.genMs : wallMs;
+		const outputTokPerSec = genMs > 0 ? round1((run.totals.output / genMs) * 1000) : 0;
+
+		// The run's sub-agent totals are derived here, after the sweep has booked anything
+		// still in the ledger: every finalized entry that was launched in this run. A
+		// background sub-agent that outlived its run carries an earlier epoch, so a later
+		// run can never claim it.
+		let subagents = 0;
+		let subagentTokenTotal = 0;
+		for (const entry of subagentLedger.values()) {
+			if (entry.finalized && entry.runNumber === run.epoch) {
+				subagents += 1;
+				subagentTokenTotal += entry.tokensUsed;
+			}
+		}
 
 		const record: RunRecord = {
 			ts: new Date().toISOString(),
 			sessionId,
 			cwd: cmd.cwd,
 			stopReason,
-			input: run.input,
-			output: run.output,
-			cacheRead: run.cacheRead,
-			cacheWrite: run.cacheWrite,
-			requests: run.requests,
-			models: [...runModels],
+			input: run.totals.input,
+			output: run.totals.output,
+			cacheRead: run.totals.cacheRead,
+			cacheWrite: run.totals.cacheWrite,
+			requests: run.totals.requests,
+			models: [...run.models],
 			durationMs: wallMs,
 			genMs,
 			outputTokPerSec,
-			subagents: runSubagentRuns,
-			subagentTokens: runSubagentTokens,
+			subagents,
+			subagentTokens: subagentTokenTotal,
 		};
 
-		if (run.requests > 0 || run.input + run.output > 0) {
+		if (run.totals.requests > 0 || run.totals.input + run.totals.output > 0) {
 			const settings = resolveSettings();
 			if (settings.log) {
 				try {
@@ -704,16 +729,10 @@ export default function (cmd: ModApi): void {
 	// ── events ────────────────────────────────────────────────────────────────────────
 
 	cmd.on('run_start', ({sessionId: id} = {}) => {
-		run = zeros();
-		runModels = new Set();
-		runStartedAt = Date.now();
-		runGenMs = 0;
-		runSubagentRuns = 0;
-		runSubagentTokens = 0;
-		// A new epoch: any sub-agent still in flight from a previous run is now stale and
-		// must not be attributed to this one.
-		runNumber += 1;
-		reportedRunEnd = false;
+		// Rebuilding through newRun resets every run-scoped field at once. The bumped epoch
+		// makes any sub-agent still in flight from a previous run stale — it must not be
+		// attributed to this one.
+		run = newRun(run.epoch + 1, Date.now());
 		if (typeof id === 'string') sessionId = id;
 	});
 
@@ -729,9 +748,9 @@ export default function (cmd: ModApi): void {
 		requestStartAt = undefined;
 
 		addTotals(session, parsed);
-		addTotals(run, parsed);
-		runModels.add(modelId);
-		runGenMs += elapsedMs;
+		addTotals(run.totals, parsed);
+		run.models.add(modelId);
+		run.genMs += elapsedMs;
 		if (parsed.cacheWrite > 0) sawCacheWrite = true;
 
 		const seconds = elapsedMs / 1000;
@@ -753,12 +772,14 @@ export default function (cmd: ModApi): void {
 
 	cmd.on('subagent_start', ({toolCallId, subagentType, background} = {}) => {
 		if (typeof toolCallId !== 'string') return;
-		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
-		// The run the sub-agent was launched in, for attribution when it finalizes.
-		entry.runNumber = runNumber;
-		// A background sub-agent outlives the tool call that launched it, so its stop is
-		// already its completion signal.
-		entry.background = background === true;
+		// Declare the facts: the run the sub-agent was launched in (for attribution when it
+		// finalizes), and that a background one outlives the tool call that launched it — so
+		// its stop is already its completion signal.
+		updateSubagent(
+			toolCallId,
+			{runNumber: run.epoch, background: background === true},
+			typeof subagentType === 'string' ? subagentType : undefined,
+		);
 	});
 
 	cmd.on('subagent_stop', ({toolCallId, subagentType, tokensUsed} = {}) => {
@@ -767,13 +788,10 @@ export default function (cmd: ModApi): void {
 		// estimate and is deliberately never subscribed to, for the same reason.)
 		const tokens = num(tokensUsed);
 		if (tokens <= 0 || typeof toolCallId !== 'string') return;
-		// Once an entry is finalized it is immutable: a late stop must not rewrite the count
-		// its committed totals (and its durable record) were built from, or the report's cache
-		// numerator would drift away from its latched denominator.
-		if (subagentLedger.get(toolCallId)?.finalized === true) return;
-		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
-		entry.tokensUsed = tokens;
-		finalizeSubagent(entry);
+		// The finalized-entry immutability rule lives in updateSubagent: a late stop cannot
+		// rewrite the count its committed totals (and its durable record) were built from, or
+		// the report's cache numerator would drift away from its latched denominator.
+		updateSubagent(toolCallId, {tokensUsed: tokens}, typeof subagentType === 'string' ? subagentType : undefined);
 	});
 
 	cmd.on('session_start', () => resetSession());
@@ -793,18 +811,13 @@ export default function (cmd: ModApi): void {
 			finalizeRun(result);
 		},
 		afterToolCall: ({toolCallId, toolName, result} = {}) => {
-			// A foreground sub-agent is done when the `agent` tool call that launched it
-			// completes. The result text also carries the sub-agent's usage trailer, so parse
-			// it here — before finalizing — so the durable record written at commit time can
-			// include it.
+			// Declare the facts: a foreground sub-agent is done when the `agent` tool call that
+			// launched it completes, and its result text carries the usage trailer. Recording
+			// the trailer before finalizing lets the durable record include it. A trailer
+			// arriving after commit is dropped by updateSubagent — it could only make the
+			// report claim a cache figure the durable record cannot support.
 			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
-			const entry = subagentEntry(toolCallId);
-			// A finalized entry is immutable: a trailer arriving after commit could only make
-			// the report claim a cache figure the durable record cannot support.
-			if (entry.finalized) return;
-			entry.trailer = parseSubagentTrailer(result);
-			entry.agentDone = true;
-			finalizeSubagent(entry);
+			updateSubagent(toolCallId, {trailer: parseSubagentTrailer(result), agentDone: true});
 		},
 	});
 
