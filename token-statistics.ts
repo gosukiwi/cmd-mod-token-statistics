@@ -380,8 +380,13 @@ export default function (cmd: ModApi): void {
 		}
 
 		mkdirSync(dirname(CONFIG_PATH), {recursive: true});
+		// The per-model aggregate was dropped, but an older version may have left the key in
+		// the file. Delete it from the merged object so every rewrite (a per-run fold or the
+		// reset) actually removes it, rather than carrying it forward.
+		const merged: Record<string, unknown> = {...current, ...patch};
+		delete merged.byModel;
 		const temporary = `${CONFIG_PATH}.tmp`;
-		writeFileSync(temporary, `${JSON.stringify({...current, ...patch}, null, 2)}\n`, {mode});
+		writeFileSync(temporary, `${JSON.stringify(merged, null, 2)}\n`, {mode});
 		renameSync(temporary, CONFIG_PATH);
 		cachedConfig = undefined; // take effect at once, without waiting for an mtime change
 	}
@@ -611,7 +616,13 @@ export default function (cmd: ModApi): void {
 		// interrupted run, or a provider that does not emit it).
 		if (run.requests === 0) {
 			const fallback = readUsage(typed.usage);
-			if (fallback.input + fallback.output > 0) addTotals(run, fallback, 0);
+			if (fallback.input + fallback.output > 0) {
+				addTotals(run, fallback, 0);
+				// Mirror it into the session view too. The run fallback carries no request
+				// count (it is not a real request), but the tokens are real and would
+				// otherwise be counted by the lifetime totals yet invisible to /token-stats.
+				addTotals(session, fallback, 0);
+			}
 		}
 
 		const wallMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
@@ -717,6 +728,10 @@ export default function (cmd: ModApi): void {
 		// estimate and is deliberately never subscribed to, for the same reason.)
 		const tokens = num(tokensUsed);
 		if (tokens <= 0 || typeof toolCallId !== 'string') return;
+		// Once an entry is finalized it is immutable: a late stop must not rewrite the count
+		// its committed totals (and its durable record) were built from, or the report's cache
+		// numerator would drift away from its latched denominator.
+		if (subagentLedger.get(toolCallId)?.finalized === true) return;
 		const entry = subagentEntry(toolCallId, typeof subagentType === 'string' ? subagentType : undefined);
 		entry.tokensUsed = tokens;
 		finalizeSubagent(entry);
@@ -731,13 +746,13 @@ export default function (cmd: ModApi): void {
 	// onRunEnd is the awaited hook, so the log write is guaranteed to complete before the
 	// process moves on. The run_end observer is a fallback for the rare path where the
 	// hook does not fire; finalizeRun's guard keeps the two from double-reporting.
+	//
+	// Both hooks are registered in one call: the mod must not depend on the host merging
+	// successive cmd.hooks calls into one object.
 	cmd.hooks({
 		onRunEnd: async ({result} = {}) => {
 			finalizeRun(result);
 		},
-	});
-
-	cmd.hooks({
 		afterToolCall: ({toolCallId, toolName, result} = {}) => {
 			// A foreground sub-agent is done when the `agent` tool call that launched it
 			// completes. The result text also carries the sub-agent's usage trailer, so parse
@@ -745,6 +760,9 @@ export default function (cmd: ModApi): void {
 			// include it.
 			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
 			const entry = subagentEntry(toolCallId);
+			// A finalized entry is immutable: a trailer arriving after commit could only make
+			// the report claim a cache figure the durable record cannot support.
+			if (entry.finalized) return;
 			entry.trailer = parseSubagentTrailer(result);
 			entry.agentDone = true;
 			finalizeSubagent(entry);
@@ -766,7 +784,7 @@ export default function (cmd: ModApi): void {
 
 	cmd.addCommand({
 		name: 'token-stats',
-		description: 'Show token statistics — session, lifetime, cache hits and tokens/sec',
+		description: 'Session token totals and, when sub-agents ran, one combined sub-agent line',
 		handler: ({args}: {args?: unknown} = {}) => {
 			const sub = String(args ?? '').trim().toLowerCase();
 			if (sub === 'reset') {
@@ -792,7 +810,9 @@ export default function (cmd: ModApi): void {
 
 	// At most two lines: the session totals, plus a sub-agent line when one has been counted.
 	function reportText(): string {
-		if (session.requests === 0) return 'no requests recorded yet this session';
+		if (session.requests === 0 && session.input === 0 && session.output === 0) {
+			return 'no requests recorded yet this session';
+		}
 		const lines = [
 			row(
 				'session',

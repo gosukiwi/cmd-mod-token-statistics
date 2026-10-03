@@ -38,6 +38,7 @@ interface FakeMod {
 	statuses: (string | null)[];
 	entries: {type: string; data: any}[];
 	renderers: Map<string, (data: any) => readonly string[]>;
+	registeredHooks: any[];
 	emit: (event: string, payload?: any) => void;
 	hook: (name: string, arg?: any) => any;
 }
@@ -96,6 +97,7 @@ function makeFakeCmd(
 		statuses,
 		entries,
 		renderers,
+		registeredHooks,
 		emit: (event, payload) => {
 			for (const handler of handlers.get(event) ?? []) handler(payload);
 		},
@@ -203,6 +205,16 @@ test('registers the flags, command, renderer and events it documents', () => {
 	}
 	// subagent_progress carries an estimate, not a measurement — it must never be read.
 	assert.equal(fake.events.has('subagent_progress'), false, 'subagent_progress must not be subscribed');
+});
+
+test('registers onRunEnd and afterToolCall in a single merged cmd.hooks call', () => {
+	const fake = setup();
+
+	// One registration, both hooks on it — the mod must not rely on the host merging
+	// successive cmd.hooks calls.
+	assert.equal(fake.registeredHooks.length, 1, 'a single merged cmd.hooks registration');
+	assert.equal(typeof fake.registeredHooks[0].onRunEnd, 'function');
+	assert.equal(typeof fake.registeredHooks[0].afterToolCall, 'function');
 });
 
 // ---------------------------------------------------------------------------
@@ -330,6 +342,31 @@ test('lifetime totals persist across sessions', async (t) => {
 	assert.equal(readLogLines().length, 2);
 });
 
+test('a pre-existing byModel key is removed from the state file', async (t) => {
+	useFakeTimers(t);
+	mkdirSync(STATE_DIR, {recursive: true});
+	writeFileSync(
+		CONFIG,
+		JSON.stringify({
+			byModel: {'old-model': {input: 5}},
+			lifetime: {input: 1, output: 1, cacheRead: 0, cacheWrite: 0, requests: 1, runs: 1, since: '2020-01-01T00:00:00.000Z'},
+		}),
+	);
+
+	const fake = setup();
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+	assert.equal(readState().byModel, undefined, 'the per-run fold drops byModel');
+
+	// The reset path must drop it too, even when it was seeded just before.
+	writeFileSync(CONFIG, JSON.stringify({byModel: {'old-model': {input: 5}}, lifetime: {input: 1}}));
+	const resetting = setup({confirm: true});
+	resetting.commands.get('token-stats')!({args: 'reset'});
+	await settle();
+	assert.equal(readState().byModel, undefined, 'the reset drops byModel');
+});
+
 test('onRunEnd and run_end never double-count one run', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
@@ -355,6 +392,19 @@ test('a run with no model_request_end falls back to the harness usage', async (t
 	assert.equal(lines[0].output, 20);
 	assert.equal(lines[0].stopReason, 'interrupted');
 	assert.equal(readState().lifetime.input, 300);
+});
+
+test('tokens that only arrived via the run fallback are visible in the report', async (t) => {
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	// No model_request_end at all: the only numbers are the harness-reported usage.
+	await fake.hook('onRunEnd', {result: {stopReason: 'interrupted', usage: usage(300, 20)}});
+
+	const message = report(fake);
+	assert.notEqual(message, 'no requests recorded yet this session');
+	assert.match(message, /▲ 300 in/);
+	assert.match(message, /▼ 20 out/);
 });
 
 test('a corrupt state file is ignored rather than crashing the run', async (t) => {
@@ -975,15 +1025,16 @@ test('a cache write only withholds the figure for the session it happened in', (
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 800), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
-	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	// A finalized entry is immutable, so the trailer must land before the stop that finalizes.
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
 
 	fake.emit('session_start', {sessionId: 's2'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
 	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
-	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-2', CACHED_TRAILER);
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 1_000_000});
 
 	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
 });
@@ -995,13 +1046,55 @@ test('the figure sums the per-sub-agent gaps and clamps a shortfall to zero', (t
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
-	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	// A trailer total below the measured spend contributes nothing — never a negative.
 	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
-	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
 	finishAgentCallWithResult(fake, 'call-2', '<usage>total_tokens: 400000</usage>');
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
 
 	// 250k cached of 1.5M spent.
 	assert.equal(subagentLine(fake), '  subagents 1.5M tok  ⛁ ≥17% cached · 2 runs');
+});
+
+// A trailer whose total sits a little above the measured spend, so the cache figure works
+// out to a sane, exact percentage.
+const MEASURED_TRAILER = '<usage>total_tokens: 6300</usage>';
+
+test('a late subagent_stop cannot rewrite an already-finalized sub-agent', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallWithResult(fake, 'call-1', MEASURED_TRAILER);
+	// The entry is finalized now; a second stop with a different count must be a no-op.
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 9000});
+
+	// The measured 4200 is what both the line and the cache figure are built from.
+	assert.equal(subagentLine(fake), '  subagents 4.2k tok  ⛁ ≥50% cached · 1 run');
+	assert.match(report(fake), /4\.2k tok/);
+
+	const records = subagentRecords();
+	assert.equal(records.length, 1);
+	assert.equal(records[0].tokensUsed, 4200, 'the committed record keeps the original count');
+});
+
+test('a trailer that arrives after the run-end sweep never reaches the report', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	// The sweep finalizes it with no trailer and writes the durable record without a total.
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+	// The agent tool call completes late, carrying a trailer the record will never have.
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+
+	assert.equal(subagentLine(fake), '  subagents 4.2k tok · 1 run');
+	assert.equal(subagentRecords()[0].totalTokens, undefined);
 });
