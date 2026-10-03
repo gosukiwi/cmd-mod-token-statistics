@@ -25,7 +25,7 @@
 //
 // Surfaces:
 //   • footer segment (cmd.ui.setStatus) — live session totals, tok/s, context usage
-//   • /token-stats                     — full breakdown: session, lifetime, cache, models
+//   • /token-stats                     — session totals plus sub-agent usage (at most two lines)
 //   • a per-run feed row (opt-in via the "summary" setting)
 //
 // Headless (`cmd -p`) renders no footer and drops feed rows, but the log still writes —
@@ -80,7 +80,6 @@ interface StateFile {
 	readonly log?: boolean;
 	readonly contextInStatus?: boolean;
 	readonly lifetime?: Partial<Lifetime>;
-	readonly byModel?: Record<string, Partial<Totals>>;
 }
 
 interface Usage {
@@ -88,6 +87,32 @@ interface Usage {
 	readonly output: number;
 	readonly cacheRead: number;
 	readonly cacheWrite: number;
+}
+
+// The usage trailer the `agent` tool appends to its result text. Every field is optional:
+// the whole block may be absent, or a key may be missing or not a number.
+interface SubagentTrailer {
+	readonly turns?: number;
+	readonly toolUses?: number;
+	readonly durationMs?: number;
+	readonly totalTokens?: number;
+}
+
+// One in-flight sub-agent, keyed by the `agent` tool call that launched it. A stop carries
+// the token count, but the entry is only finalizable once the sub-agent is known to be done:
+// a background one is done when it stops, a foreground one when its tool call completes.
+interface SubagentRun {
+	toolCallId: string;
+	subagentType: string | undefined;
+	background: boolean;
+	agentDone: boolean;
+	tokensUsed: number;
+	trailer: SubagentTrailer | undefined;
+	finalized: boolean;
+	// The run epoch this entry was launched in. A background sub-agent outlives the run that
+	// launched it, so its finalize must be attributed to that run — not to whichever run
+	// happens to be in flight when it stops.
+	runNumber: number;
 }
 
 interface RunRecord {
@@ -108,8 +133,52 @@ interface RunRecord {
 	readonly subagentTokens: number;
 }
 
+// One durable line per finalized sub-agent, alongside the per-run lines. The four trailer
+// fields are dropped by JSON.stringify when undefined, so an unknown value never lands as
+// null — the key is simply absent.
+interface SubagentRecord {
+	readonly ts: string;
+	readonly kind: 'subagent';
+	readonly sessionId: string | undefined;
+	readonly toolCallId: string;
+	readonly subagentType: string | undefined;
+	readonly tokensUsed: number;
+	readonly turns?: number;
+	readonly toolUses?: number;
+	readonly durationMs?: number;
+	readonly totalTokens?: number;
+}
+
 function zeros(): Totals {
 	return {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0};
+}
+
+// Run-scoped state — everything that restarts on a run_start. Bundled into one object built
+// by one factory so a future run-scoped field cannot be added to one reset site (a new
+// session) and forgotten in the other (a new run).
+interface RunState {
+	totals: Totals;
+	// The model ids seen this run, for the per-run log line. Only the ids are needed — the
+	// per-model totals were dropped along with the report's models row.
+	models: Set<string>;
+	startedAt: number | undefined;
+	genMs: number;
+	reportedEnd: boolean;
+	// A run epoch, bumped on every run_start. A sub-agent records the epoch it launched in,
+	// so its finalize can tell whether the launching run is still the active one — a
+	// background sub-agent's stop may arrive during a later run.
+	epoch: number;
+}
+
+function newRun(epoch: number, startedAt?: number): RunState {
+	return {
+		totals: zeros(),
+		models: new Set(),
+		startedAt,
+		genMs: 0,
+		reportedEnd: false,
+		epoch,
+	};
 }
 
 // Coerce anything that is not a finite number to 0 — usage fields arrive from providers
@@ -129,6 +198,52 @@ function readUsage(raw: unknown): Usage {
 		output: num(usage.outputTokens),
 		cacheRead: num(usage.cacheReadTokens ?? details.cacheReadTokens ?? usage.cachedInputTokens),
 		cacheWrite: num(usage.cacheWriteTokens ?? details.cacheWriteTokens),
+	};
+}
+
+// The hook's `result` is the tool's *content*, not a bare string: the harness builds tools
+// with `textResult({text})`, which returns `{ok: true, content: [{type: 'text', text}]}`, and
+// hands the `.content` array to `afterToolCall`. So the `agent` tool's result — the thing the
+// `<usage>` trailer lives in — arrives as an array of content blocks. Normalize either shape
+// down to its text; anything else has no trailer.
+function trailerText(result: unknown): string | undefined {
+	if (typeof result === 'string') return result; // tolerated, though the host never sends it
+	if (Array.isArray(result)) {
+		return result
+			.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+			.map((block) => block.text)
+			.join('\n');
+	}
+	return undefined;
+}
+
+// Parse the `<usage>` trailer the `agent` tool appends to its result text:
+//
+//   <usage>total_tokens: 1256306
+//   tool_uses: 63
+//   turns: 19
+//   duration_ms: 117189</usage>
+//
+// Tolerant by design: a result with no text (a non-string, non-array value; an empty block
+// array), a missing block, or a key that is absent or not a number leaves that field (or the
+// whole trailer) undefined — never an exception.
+function parseSubagentTrailer(result: unknown): SubagentTrailer | undefined {
+	const text = trailerText(result);
+	if (text === undefined) return undefined;
+	const block = text.match(/<usage>([\s\S]*?)<\/usage>/);
+	if (block === null) return undefined;
+	const body = block[1];
+	const read = (key: string): number | undefined => {
+		const match = body.match(new RegExp(`\\b${key}\\s*:\\s*([^\\s]+)`));
+		if (match === null) return undefined;
+		const value = Number(match[1]);
+		return Number.isFinite(value) ? value : undefined;
+	};
+	return {
+		totalTokens: read('total_tokens'),
+		toolUses: read('tool_uses'),
+		turns: read('turns'),
+		durationMs: read('duration_ms'),
 	};
 }
 
@@ -178,11 +293,6 @@ function humanDuration(ms: number): string {
 	return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`;
 }
 
-function projectName(cwd: string): string {
-	const parts = cwd.split('/').filter(Boolean);
-	return parts.at(-1) ?? cwd;
-}
-
 function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -216,12 +326,9 @@ export default function (cmd: ModApi): void {
 	const session = zeros();
 	let sessionId: string | undefined;
 
-	// Run-scoped state, reset on every run_start.
-	let run = zeros();
-	let runByModel = new Map<string, Totals>();
-	let runStartedAt: number | undefined;
-	let runGenMs = 0;
-	let reportedRunEnd = false;
+	// Run-scoped state, built fresh by newRun on every run_start (see resetSession and the
+	// run_start handler — the two reset sites cannot drift).
+	let run = newRun(0);
 
 	// Per-request timing for the "tokens per second" figures.
 	let requestStartAt: number | undefined;
@@ -232,14 +339,21 @@ export default function (cmd: ModApi): void {
 	let lastContextTokens = 0;
 	let lastContextModel: string | undefined;
 
-	// Sub-agent activity is informational — nested runs report their own token totals,
-	// which may or may not already be folded into the parent's usage. Never summed into
-	// the lifetime totals, only shown. Kept both session-wide (for the report) and
-	// run-scoped (for the log line).
-	let subagentCalls = 0;
+	// Sub-agents are informational — nested runs report their own token totals, which may or
+	// may not already be folded into the parent's usage. Never summed into the session or
+	// lifetime totals, only shown.
+	//
+	// The ledger is keyed by tool call id and holds every sub-agent that has started but not
+	// yet been finalized, so that a stop's token count can wait for the sub-agent to actually
+	// be done (see finalizeSubagent). subagentRuns / subagentTokens are session-wide (for the
+	// report); a run's own sub-agent totals are derived from the ledger at run end.
+	let subagentLedger = new Map<string, SubagentRun>();
+	let subagentRuns = 0;
 	let subagentTokens = 0;
-	let runSubagentCalls = 0;
-	let runSubagentTokens = 0;
+
+	// Whether any request this session wrote to the prompt cache. Session-scoped, like the
+	// sub-agent counters above, and one of the two conditions guarding the cache figure.
+	let sawCacheWrite = false;
 
 	let warnedWriteFailure = false;
 	let cachedConfig: {mtimeMs: number; value: StateFile} | undefined;
@@ -309,8 +423,13 @@ export default function (cmd: ModApi): void {
 		}
 
 		mkdirSync(dirname(CONFIG_PATH), {recursive: true});
+		// The per-model aggregate was dropped, but an older version may have left the key in
+		// the file. Delete it from the merged object so every rewrite (a per-run fold or the
+		// reset) actually removes it, rather than carrying it forward.
+		const merged: Record<string, unknown> = {...current, ...patch};
+		delete merged.byModel;
 		const temporary = `${CONFIG_PATH}.tmp`;
-		writeFileSync(temporary, `${JSON.stringify({...current, ...patch}, null, 2)}\n`, {mode});
+		writeFileSync(temporary, `${JSON.stringify(merged, null, 2)}\n`, {mode});
 		renameSync(temporary, CONFIG_PATH);
 		cachedConfig = undefined; // take effect at once, without waiting for an mtime change
 	}
@@ -332,28 +451,12 @@ export default function (cmd: ModApi): void {
 		warn(`token-statistics: could not save stats to ${CONFIG_PATH} (${describeError(error)}).`);
 	}
 
-	function appendLog(record: RunRecord): void {
+	// Two record kinds share the one append-only log: the per-run summary and one line per
+	// finalized sub-agent. Both go through here so the write path (and its failure mode) is
+	// identical.
+	function appendLog(record: RunRecord | SubagentRecord): void {
 		mkdirSync(dirname(LOG_PATH), {recursive: true});
 		appendFileSync(LOG_PATH, `${JSON.stringify(record)}\n`);
-	}
-
-	function readLog(): RunRecord[] {
-		let text: string;
-		try {
-			text = readFileSync(LOG_PATH, 'utf8');
-		} catch {
-			return [];
-		}
-		const records: RunRecord[] = [];
-		for (const line of text.split('\n')) {
-			if (line.trim() === '') continue;
-			try {
-				records.push(JSON.parse(line) as RunRecord);
-			} catch {
-				// A torn last line is ignored rather than failing the whole report.
-			}
-		}
-		return records;
 	}
 
 	function averageRate(): number {
@@ -395,11 +498,8 @@ export default function (cmd: ModApi): void {
 	function resetSession(): void {
 		Object.assign(session, zeros());
 		sessionId = undefined;
-		run = zeros();
-		runByModel = new Map();
-		runStartedAt = undefined;
-		runGenMs = 0;
-		reportedRunEnd = false;
+		// One atomic reset of every run-scoped field; the epoch starts over for the session.
+		run = newRun(0);
 		requestStartAt = undefined;
 		requestModel = undefined;
 		rates.sum = 0;
@@ -408,19 +508,139 @@ export default function (cmd: ModApi): void {
 		rates.max = 0;
 		lastContextTokens = 0;
 		lastContextModel = undefined;
-		subagentCalls = 0;
+		subagentLedger = new Map();
+		subagentRuns = 0;
 		subagentTokens = 0;
-		runSubagentCalls = 0;
-		runSubagentTokens = 0;
+		sawCacheWrite = false;
 	}
 
-	function modelTotals(map: Map<string, Totals>, model: string): Totals {
-		let totals = map.get(model);
-		if (totals === undefined) {
-			totals = zeros();
-			map.set(model, totals);
+	// Look up (or open) the ledger entry for a tool call id. A stop or a completion can
+	// arrive without its start; the entry is still harmless — it only ever counts once it
+	// has both a token count and a completion signal. An entry opened lazily this way is
+	// attributed to the current run.
+	function subagentEntry(toolCallId: string, subagentType?: string): SubagentRun {
+		let entry = subagentLedger.get(toolCallId);
+		if (entry === undefined) {
+			entry = {
+				toolCallId,
+				subagentType,
+				background: false,
+				agentDone: false,
+				tokensUsed: 0,
+				trailer: undefined,
+				finalized: false,
+				runNumber: run.epoch,
+			};
+			subagentLedger.set(toolCallId, entry);
 		}
-		return totals;
+		if (entry.subagentType === undefined && subagentType !== undefined) entry.subagentType = subagentType;
+		return entry;
+	}
+
+	// The one mutation point for a ledger entry: a finalized entry is immutable, so a late
+	// stop or completion can never rewrite the numbers its committed totals (and its durable
+	// record) were built from. Handlers declare only the facts they learned; the invariant
+	// lives here. The entry is opened lazily, so an event with no prior subagent_start still
+	// records what it knows.
+	//
+	// `shouldFinalize` separates a fact that could complete the entry (a stop, a tool-call
+	// completion, the run-end sweep) from one that never can (a start, which only declares
+	// where and how the sub-agent runs). A start that finalized would commit the entry before
+	// its token count — or its trailer — had a chance to arrive.
+	function updateSubagent(
+		toolCallId: string,
+		patch: Partial<SubagentRun>,
+		subagentType?: string,
+		shouldFinalize = false,
+	): void {
+		const entry = subagentEntry(toolCallId, subagentType);
+		if (entry.finalized) return;
+		Object.assign(entry, patch);
+		if (shouldFinalize) finalizeSubagent(entry);
+	}
+
+	// A sub-agent counts exactly once, and only once its tokens are known AND it is known to
+	// be done: a background one is done when it stops, a foreground one when its `agent` tool
+	// call completes. This is the one place that books an entry into the session totals and
+	// writes its durable record; `finalized` latches on the first call, so every later path —
+	// a second stop, or the run-end sweep after a normal finalize — is a no-op rather than a
+	// double count.
+	function finalizeSubagent(entry: SubagentRun): void {
+		if (entry.finalized || entry.tokensUsed <= 0) return;
+		if (!entry.background && !entry.agentDone) return;
+		entry.finalized = true;
+		subagentRuns += 1;
+		subagentTokens += entry.tokensUsed;
+		writeSubagentRecord(entry);
+	}
+
+	// One durable line per finalized sub-agent, alongside the per-run lines. Gated by the
+	// same `log` setting as the per-run record, and routed through the same warn-on-failure
+	// path so a bad write can never take the session down.
+	function writeSubagentRecord(entry: SubagentRun): void {
+		if (!resolveSettings().log) return;
+		const record: SubagentRecord = {
+			ts: new Date().toISOString(),
+			kind: 'subagent',
+			sessionId,
+			toolCallId: entry.toolCallId,
+			subagentType: entry.subagentType,
+			tokensUsed: entry.tokensUsed,
+			// The trailer fields are optional; undefined values are dropped by JSON.stringify,
+			// so an unknown one is simply absent rather than null.
+			turns: entry.trailer?.turns,
+			toolUses: entry.trailer?.toolUses,
+			durationMs: entry.trailer?.durationMs,
+			totalTokens: entry.trailer?.totalTokens,
+		};
+		try {
+			appendLog(record);
+		} catch (error) {
+			warnWriteFailure(error);
+		}
+	}
+
+	// The end of a run is the last chance to account for anything still in the ledger — the
+	// run ending is itself a completion signal, so an entry with a token count is booked even
+	// if its stop or completion never arrived (an aborted run, or a host that does not emit
+	// afterToolCall).
+	function sweepSubagents(): void {
+		for (const entry of subagentLedger.values()) {
+			// Only an entry that already holds a token count is this run's to book. A
+			// zero-token entry is left entirely untouched: marking it done would let a *later*
+			// stop finalize a foreground sub-agent whose `agent` tool call never completed —
+			// something the run ending is not a completion signal for.
+			if (entry.tokensUsed <= 0) continue;
+			// The run ending is itself a completion signal; updateSubagent keeps the
+			// finalized-immutability rule in one place and skips anything already booked.
+			updateSubagent(entry.toolCallId, {agentDone: true}, undefined, true);
+		}
+	}
+
+	// The cache figure on the subagents line. A sub-agent's trailer `total_tokens` is the
+	// whole bill for its run and `tokensUsed` is the part the agent itself measured, so the
+	// difference is the prompt the parent had already cached. Summed over the finalized
+	// sub-agents — the very entries the durable per-sub-agent records are written from, so
+	// both numbers stay auditable from the log without new report fields.
+	//
+	// Only shown when the reading holds everywhere: every finalized sub-agent carries a
+	// finite trailer total (a missing one leaves that run unauditable), and no request this
+	// session wrote to the cache (a write means a prompt was billed fresh, so the gap is not
+	// a cache hit). Otherwise the figure is withheld rather than guessed at.
+	function subagentCacheTokens(): number | undefined {
+		if (sawCacheWrite) return undefined;
+		let cached = 0;
+		let documented = 0;
+		for (const entry of subagentLedger.values()) {
+			if (!entry.finalized) continue;
+			const total = entry.trailer?.totalTokens;
+			if (total === undefined || !Number.isFinite(total)) continue;
+			documented += 1;
+			cached += Math.max(0, total - entry.tokensUsed);
+		}
+		// Every counted run must be one whose record carries a total, or the bound is a bound
+		// on an unknown quantity.
+		return documented === subagentRuns ? cached : undefined;
 	}
 
 	// Fold the finished run into the durable aggregates. The per-run log line is written
@@ -429,34 +649,25 @@ export default function (cmd: ModApi): void {
 		const file = readConfigFile();
 		const prior = file.lifetime ?? {};
 		const lifetime: Lifetime = {
-			input: num(prior.input) + run.input,
-			output: num(prior.output) + run.output,
-			cacheRead: num(prior.cacheRead) + run.cacheRead,
-			cacheWrite: num(prior.cacheWrite) + run.cacheWrite,
-			requests: num(prior.requests) + run.requests,
+			input: num(prior.input) + run.totals.input,
+			output: num(prior.output) + run.totals.output,
+			cacheRead: num(prior.cacheRead) + run.totals.cacheRead,
+			cacheWrite: num(prior.cacheWrite) + run.totals.cacheWrite,
+			requests: num(prior.requests) + run.totals.requests,
 			// foldLifetime only runs for a run that produced tokens, so every call is one run.
 			runs: num(prior.runs) + 1,
 			since: typeof prior.since === 'string' ? prior.since : new Date().toISOString(),
 		};
 
-		const byModel: Record<string, Partial<Totals>> = {...(file.byModel ?? {})};
-		for (const [model, totals] of runByModel) {
-			const existing = byModel[model] ?? {};
-			byModel[model] = {
-				input: num(existing.input) + totals.input,
-				output: num(existing.output) + totals.output,
-				cacheRead: num(existing.cacheRead) + totals.cacheRead,
-				cacheWrite: num(existing.cacheWrite) + totals.cacheWrite,
-				requests: num(existing.requests) + totals.requests,
-			};
-		}
-
-		updateConfigFile({lifetime, byModel});
+		updateConfigFile({lifetime});
 	}
 
 	function finalizeRun(result: unknown): void {
-		if (reportedRunEnd) return;
-		reportedRunEnd = true;
+		if (run.reportedEnd) return;
+		run.reportedEnd = true;
+
+		// Anything still in the ledger holding a token count is this run's to report.
+		sweepSubagents();
 
 		const typed = (result ?? {}) as Record<string, unknown>;
 		const stopReason = typeof typed.stopReason === 'string' ? typed.stopReason : 'unknown';
@@ -464,34 +675,53 @@ export default function (cmd: ModApi): void {
 		// The run's own per-request tally is the source of truth. Fall back to the
 		// harness-reported usage only when no model_request_end was observed (an
 		// interrupted run, or a provider that does not emit it).
-		if (run.requests === 0) {
+		if (run.totals.requests === 0) {
 			const fallback = readUsage(typed.usage);
-			if (fallback.input + fallback.output > 0) addTotals(run, fallback, 0);
+			if (fallback.input + fallback.output > 0) {
+				addTotals(run.totals, fallback, 0);
+				// Mirror it into the session view too. The run fallback carries no request
+				// count (it is not a real request), but the tokens are real and would
+				// otherwise be counted by the lifetime totals yet invisible to /token-stats.
+				addTotals(session, fallback, 0);
+			}
 		}
 
-		const wallMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
-		const genMs = runGenMs > 0 ? runGenMs : wallMs;
-		const outputTokPerSec = genMs > 0 ? round1((run.output / genMs) * 1000) : 0;
+		const wallMs = run.startedAt === undefined ? 0 : Date.now() - run.startedAt;
+		const genMs = run.genMs > 0 ? run.genMs : wallMs;
+		const outputTokPerSec = genMs > 0 ? round1((run.totals.output / genMs) * 1000) : 0;
+
+		// The run's sub-agent totals are derived here, after the sweep has booked anything
+		// still in the ledger: every finalized entry that was launched in this run. A
+		// background sub-agent that outlived its run carries an earlier epoch, so a later
+		// run can never claim it.
+		let subagents = 0;
+		let subagentTokenTotal = 0;
+		for (const entry of subagentLedger.values()) {
+			if (entry.finalized && entry.runNumber === run.epoch) {
+				subagents += 1;
+				subagentTokenTotal += entry.tokensUsed;
+			}
+		}
 
 		const record: RunRecord = {
 			ts: new Date().toISOString(),
 			sessionId,
 			cwd: cmd.cwd,
 			stopReason,
-			input: run.input,
-			output: run.output,
-			cacheRead: run.cacheRead,
-			cacheWrite: run.cacheWrite,
-			requests: run.requests,
-			models: [...runByModel.keys()],
+			input: run.totals.input,
+			output: run.totals.output,
+			cacheRead: run.totals.cacheRead,
+			cacheWrite: run.totals.cacheWrite,
+			requests: run.totals.requests,
+			models: [...run.models],
 			durationMs: wallMs,
 			genMs,
 			outputTokPerSec,
-			subagents: runSubagentCalls,
-			subagentTokens: runSubagentTokens,
+			subagents,
+			subagentTokens: subagentTokenTotal,
 		};
 
-		if (run.requests > 0 || run.input + run.output > 0) {
+		if (run.totals.requests > 0 || run.totals.input + run.totals.output > 0) {
 			const settings = resolveSettings();
 			if (settings.log) {
 				try {
@@ -514,13 +744,10 @@ export default function (cmd: ModApi): void {
 	// ── events ────────────────────────────────────────────────────────────────────────
 
 	cmd.on('run_start', ({sessionId: id} = {}) => {
-		run = zeros();
-		runByModel = new Map();
-		runStartedAt = Date.now();
-		runGenMs = 0;
-		runSubagentCalls = 0;
-		runSubagentTokens = 0;
-		reportedRunEnd = false;
+		// Rebuilding through newRun resets every run-scoped field at once. The bumped epoch
+		// makes any sub-agent still in flight from a previous run stale — it must not be
+		// attributed to this one.
+		run = newRun(run.epoch + 1, Date.now());
 		if (typeof id === 'string') sessionId = id;
 	});
 
@@ -536,9 +763,10 @@ export default function (cmd: ModApi): void {
 		requestStartAt = undefined;
 
 		addTotals(session, parsed);
-		addTotals(run, parsed);
-		addTotals(modelTotals(runByModel, modelId), parsed);
-		runGenMs += elapsedMs;
+		addTotals(run.totals, parsed);
+		run.models.add(modelId);
+		run.genMs += elapsedMs;
+		if (parsed.cacheWrite > 0) sawCacheWrite = true;
 
 		const seconds = elapsedMs / 1000;
 		if (parsed.output > 0 && seconds > 0) {
@@ -557,11 +785,35 @@ export default function (cmd: ModApi): void {
 		refreshStatus();
 	});
 
-	cmd.on('subagent_stop', ({tokensUsed} = {}) => {
-		subagentCalls += 1;
-		subagentTokens += num(tokensUsed);
-		runSubagentCalls += 1;
-		runSubagentTokens += num(tokensUsed);
+	cmd.on('subagent_start', ({toolCallId, subagentType, background} = {}) => {
+		if (typeof toolCallId !== 'string') return;
+		// Declare the facts only: the run the sub-agent was launched in (for attribution when
+		// it finalizes), and that a background one outlives the tool call that launched it —
+		// so its stop is already its completion signal. A start never finalizes: the entry's
+		// token count and its trailer are still to come (and a duplicate/out-of-order start
+		// must not commit the entry before them).
+		updateSubagent(
+			toolCallId,
+			{runNumber: run.epoch, background: background === true},
+			typeof subagentType === 'string' ? subagentType : undefined,
+		);
+	});
+
+	cmd.on('subagent_stop', ({toolCallId, subagentType, tokensUsed} = {}) => {
+		// A stop with no measured token count is noise, not a run: it must never create an
+		// entry, finalize anything, or move a total. (`subagent_progress` carries an
+		// estimate and is deliberately never subscribed to, for the same reason.)
+		const tokens = num(tokensUsed);
+		if (tokens <= 0 || typeof toolCallId !== 'string') return;
+		// The finalized-entry immutability rule lives in updateSubagent: a late stop cannot
+		// rewrite the count its committed totals (and its durable record) were built from, or
+		// the report's cache numerator would drift away from its latched denominator.
+		updateSubagent(
+			toolCallId,
+			{tokensUsed: tokens},
+			typeof subagentType === 'string' ? subagentType : undefined,
+			true,
+		);
 	});
 
 	cmd.on('session_start', () => resetSession());
@@ -573,9 +825,21 @@ export default function (cmd: ModApi): void {
 	// onRunEnd is the awaited hook, so the log write is guaranteed to complete before the
 	// process moves on. The run_end observer is a fallback for the rare path where the
 	// hook does not fire; finalizeRun's guard keeps the two from double-reporting.
+	//
+	// Both hooks are registered in one call: the mod must not depend on the host merging
+	// successive cmd.hooks calls into one object.
 	cmd.hooks({
 		onRunEnd: async ({result} = {}) => {
 			finalizeRun(result);
+		},
+		afterToolCall: ({toolCallId, toolName, result} = {}) => {
+			// Declare the facts: a foreground sub-agent is done when the `agent` tool call that
+			// launched it completes, and its result text carries the usage trailer. Recording
+			// the trailer before finalizing lets the durable record include it. A trailer
+			// arriving after commit is dropped by updateSubagent — it could only make the
+			// report claim a cache figure the durable record cannot support.
+			if (toolName !== 'agent' || typeof toolCallId !== 'string') return;
+			updateSubagent(toolCallId, {trailer: parseSubagentTrailer(result), agentDone: true}, undefined, true);
 		},
 	});
 
@@ -594,7 +858,7 @@ export default function (cmd: ModApi): void {
 
 	cmd.addCommand({
 		name: 'token-stats',
-		description: 'Show token statistics — session, lifetime, cache hits and tokens/sec',
+		description: 'Session token totals and, when sub-agents ran, one combined sub-agent line',
 		handler: ({args}: {args?: unknown} = {}) => {
 			const sub = String(args ?? '').trim().toLowerCase();
 			if (sub === 'reset') {
@@ -606,7 +870,7 @@ export default function (cmd: ModApi): void {
 					.then((confirmed) => {
 						if (!confirmed) return;
 						try {
-							updateConfigFile({lifetime: undefined, byModel: {}});
+							updateConfigFile({lifetime: undefined});
 							cmd.ui.notify('token-statistics: lifetime totals reset.');
 						} catch (error) {
 							warn(`token-statistics: could not reset stats (${describeError(error)}).`);
@@ -618,81 +882,19 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
+	// One line: the session totals, plus an inline sub-agent cluster when one has been counted.
 	function reportText(): string {
-		const file = readConfigFile();
-		const lifetime = file.lifetime;
-		const byModel = file.byModel ?? {};
-		const log = readLog();
-		const lines: string[] = [
-			`Token statistics · ${projectName(cmd.cwd)}`,
-			row('session', sessionLine()),
-			row('lifetime', lifetimeLine(lifetime)),
-			row('speed', speedLine()),
-			row('context', contextLine()),
-			row('models', modelLines(byModel)),
-		];
-		if (subagentCalls > 0) {
-			lines.push(row('subagents', `${plural(subagentCalls, 'run')} · ${formatTokens(subagentTokens)} tokens`));
+		if (session.requests === 0 && session.input === 0 && session.output === 0) {
+			return 'no requests recorded yet this session';
 		}
-		lines.push(row('log', `${LOG_PATH} · ${plural(log.length, 'record')}`));
-		return lines.join('\n');
-	}
-
-	function row(label: string, value: string): string {
-		return `  ${label.padEnd(10)}${value}`;
-	}
-
-	function sessionLine(): string {
-		if (session.requests === 0) return 'no requests recorded yet this session';
-		return `${totalsLine(session)}  ·  ${plural(session.requests, 'request')}`;
-	}
-
-	function lifetimeLine(lifetime: Partial<Lifetime> | undefined): string {
-		if (lifetime === undefined || num(lifetime.requests) === 0) return 'nothing recorded yet';
-		return `${totalsLine(lifetime)}  ·  ${plural(num(lifetime.runs), 'run')} since ${shortDate(lifetime.since)}`;
-	}
-
-	function speedLine(): string {
-		if (rates.count === 0) return 'no timings yet';
-		const base = `avg ${formatRate(averageRate())} tok/s`;
-		if (rates.count === 1) return `${base}  ·  over 1 request`;
-		return `${base}  ·  range ${formatRate(rates.min)}–${formatRate(rates.max)}  ·  over ${plural(rates.count, 'request')}`;
-	}
-
-	function contextLine(): string {
-		if (lastContextTokens === 0) return 'not measured yet';
-		const window = contextWindowFor(lastContextModel);
-		const suffix = lastContextModel === undefined ? '' : `  ·  ${lastContextModel}`;
-		return window === undefined
-			? `${formatTokens(lastContextTokens)} tokens (window unknown)${suffix}`
-			: `${formatTokens(lastContextTokens)} / ${formatTokens(window)} (${percent(lastContextTokens, window)}%)${suffix}`;
-	}
-
-	function modelLines(byModel: Record<string, Partial<Totals>>): string {
-		const entries = Object.entries(byModel)
-			.map(([model, totals]) => ({model, totals}))
-			.filter((entry) => num(entry.totals.requests) > 0)
-			.sort((a, b) => num(b.totals.input) + num(b.totals.output) - (num(a.totals.input) + num(a.totals.output)))
-			.slice(0, 5);
-
-		if (entries.length === 0) return 'nothing recorded yet';
-		return entries
-			.map(
-				({model, totals}) =>
-					`${model}  ▲ ${formatTokens(num(totals.input))} ▼ ${formatTokens(num(totals.output))}  (${plural(num(totals.requests), 'request')})`,
-			)
-			.join('\n            ');
-	}
-
-	function totalsLine(totals: Pick<Totals, 'input' | 'output' | 'cacheRead' | 'cacheWrite'>): string {
-		const cache = `⛁ ${percent(totals.cacheRead, totals.input)}% cached`;
-		const write = totals.cacheWrite > 0 ? ` (${formatTokens(totals.cacheWrite)} written)` : '';
-		return `▲ ${formatTokens(totals.input)} in  ▼ ${formatTokens(totals.output)} out  ${cache}${write}`;
-	}
-
-	function shortDate(value: unknown): string {
-		if (typeof value !== 'string') return 'unknown';
-		const date = new Date(value);
-		return Number.isNaN(date.getTime()) ? 'unknown' : date.toISOString().slice(0, 10);
+		let line = `▲ ${formatTokens(session.input)} in  ▼ ${formatTokens(session.output)} out  ⚡ ${formatRate(averageRate())} tok/s  ⛁ ${percent(session.cacheRead, session.input)}% cached`;
+		if (subagentRuns > 0) {
+			// The cache cluster is all-or-nothing: a `≥` bound is only worth printing when it
+			// is a bound on every run shown.
+			const cached = subagentCacheTokens();
+			const cache = cached === undefined ? '' : `  ⛁ ≥${percent(cached, subagentTokens)}% cached`;
+			line += `  ·  sub ${formatTokens(subagentTokens)} tok${cache} · ${plural(subagentRuns, 'run')}`;
+		}
+		return line;
 	}
 }
