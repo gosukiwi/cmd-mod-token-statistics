@@ -464,18 +464,33 @@ function stopSubagent(fake: FakeMod, payload: Record<string, unknown>): void {
 	fake.emit('subagent_stop', {status: 'ok', ...payload});
 }
 
-// The `agent` tool call that launched a sub-agent has finished.
-function finishAgentCall(fake: FakeMod, toolCallId: string, toolName = 'agent'): void {
-	fake.hook('afterToolCall', {toolCallId, toolName, result: 'anything'});
+// The `agent` tool's result content, exactly as the host hands it to `afterToolCall`: an
+// array of content blocks (the harness's `textResult` builds `{ok, content:[{type:'text',text}]}`
+// and passes `.content`), NOT the string the `<usage>` trailer lives in.
+function agentContent(text: string): {type: 'text'; text: string}[] {
+	return [{type: 'text', text}];
 }
 
-// The same completion, but with a specific result — the `agent` tool's result text carries
-// a `<usage>` trailer that the mod parses.
-function finishAgentCallWithResult(fake: FakeMod, toolCallId: string, result: unknown, toolName = 'agent'): void {
+// The `agent` tool call that launched a sub-agent has finished. The plain case carries no
+// `<usage>` trailer, so it stands for a launch ack or an ordinary completion.
+function finishAgentCall(fake: FakeMod, toolCallId: string, toolName = 'agent'): void {
+	fake.hook('afterToolCall', {toolCallId, toolName, result: agentContent('anything')});
+}
+
+// The same completion, but with specific result text — the `agent` tool's result text carries
+// a `<usage>` trailer that the mod parses — wrapped in the real content-block array.
+function finishAgentCallWithResult(fake: FakeMod, toolCallId: string, text: string, toolName = 'agent'): void {
+	fake.hook('afterToolCall', {toolCallId, toolName, result: agentContent(text)});
+}
+
+// The raw result form, for the tolerance tests: a value that is neither the string nor the
+// content-block array the host actually sends.
+function finishAgentCallRaw(fake: FakeMod, toolCallId: string, result: unknown, toolName = 'agent'): void {
 	fake.hook('afterToolCall', {toolCallId, toolName, result});
 }
 
-// The real trailer shape, verbatim from the `agent` tool.
+// The real trailer text, verbatim from the `agent` tool; the helper wraps it in the
+// content-block array the host delivers.
 const USAGE_TRAILER =
 	'Investigated the module.\n<usage>total_tokens: 1256306\ntool_uses: 63\nturns: 19\nduration_ms: 117189</usage>';
 
@@ -591,6 +606,8 @@ test('finalization is idempotent', async (t) => {
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
+	// The launch ack is the background sub-agent's only `agent`-tool result: no trailer.
+	finishAgentCall(fake, 'call-1');
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 	// A repeated stop, the run-end sweep and a late tool-call completion must all no-op.
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
@@ -660,6 +677,89 @@ test('a new session starts with no sub-agent activity to report', (t) => {
 // ---------------------------------------------------------------------------
 // Per-sub-agent durable log record
 // ---------------------------------------------------------------------------
+
+// Fix A regression: the host hands `afterToolCall` the tool's content — for the `agent` tool
+// an array of text blocks — so the mod must read the trailer out of that array rather than
+// only off a bare string.
+test('the real content-block result carries the usage trailer into the record and report', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallRaw(fake, 'call-1', [
+		{
+			type: 'text',
+			text: 'done\n\n<usage>total_tokens: 6300\ntool_uses: 4\nturns: 3\nduration_ms: 1200</usage>',
+		},
+	]);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [record] = subagentRecords();
+	assert.equal(record.turns, 3);
+	assert.equal(record.toolUses, 4);
+	assert.equal(record.durationMs, 1200);
+	assert.equal(record.totalTokens, 6300);
+	assert.equal(record.tokensUsed, 4200);
+	// 6300 − 4200 = 2100 cached of 4200 spent is 50%.
+	assert.equal(subagentLine(fake), '  subagents 4.2k tok  ⛁ ≥50% cached · 1 run');
+});
+
+test('a bare-string agent result is still parsed for the trailer (tolerance)', async (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	finishAgentCallRaw(
+		fake,
+		'call-1',
+		'done\n\n<usage>total_tokens: 6300\ntool_uses: 4\nturns: 3\nduration_ms: 1200</usage>',
+	);
+	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
+
+	const [record] = subagentRecords();
+	assert.equal(record.turns, 3);
+	assert.equal(record.totalTokens, 6300);
+});
+
+test('an empty or non-text content array yields no trailer and does not throw', (t) => {
+	useFakeTimers(t);
+	const fake = setup();
+
+	fake.emit('run_start', {sessionId: 's1'});
+	modelCall(fake, t, 'm', usage(100, 10), 100);
+
+	// An empty content array — the real shape, but with nothing to read.
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
+	assert.doesNotThrow(() => finishAgentCallRaw(fake, 'call-1', []));
+
+	// Blocks that are not text, or text blocks with no string — none carries a trailer.
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore'});
+	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500});
+	assert.doesNotThrow(() =>
+		finishAgentCallRaw(fake, 'call-2', [{type: 'image', data: 'x'}, {type: 'text'}, null]),
+	);
+
+	const records = subagentRecords();
+	assert.equal(records.length, 2);
+	for (const record of records) {
+		assert.deepEqual(Object.keys(record), [
+			'ts',
+			'kind',
+			'sessionId',
+			'toolCallId',
+			'subagentType',
+			'tokensUsed',
+		]);
+	}
+	assert.equal(subagentLine(fake), '  subagents 4.7k tok · 2 runs');
+});
 
 test('a finalized sub-agent appends one durable record with its parsed usage trailer', async (t) => {
 	useFakeTimers(t);
@@ -766,7 +866,7 @@ test('a trailer with a missing or non-numeric key keeps only the known fields', 
 	assert.equal(record.totalTokens, undefined);
 });
 
-test('a non-string agent result is tolerated and carries no trailer', async (t) => {
+test('a non-string, non-array agent result is tolerated and carries no trailer', async (t) => {
 	useFakeTimers(t);
 	const fake = setup();
 
@@ -775,7 +875,7 @@ test('a non-string agent result is tolerated and carries no trailer', async (t) 
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 4200});
 	assert.doesNotThrow(() =>
-		finishAgentCallWithResult(fake, 'call-1', {not: 'a string with a trailer'}),
+		finishAgentCallRaw(fake, 'call-1', {not: 'a string with a trailer'}),
 	);
 	await fake.hook('onRunEnd', {result: {stopReason: 'end_turn'}});
 
@@ -798,9 +898,11 @@ test('a background sub-agent logs on its stop, before any trailer is known', asy
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10), 100);
 	startSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', background: true});
+	// A background launch's only `agent` result is the acknowledgement — no `<usage>` block.
+	finishAgentCall(fake, 'bg-1');
 	stopSubagent(fake, {toolCallId: 'bg-1', subagentType: 'review', tokensUsed: 1000});
 
-	// The record lands at stop time, while the run is still going, with no trailer yet.
+	// The record lands at stop time, while the run is still going, with no trailer ever seen.
 	const [record] = subagentRecords();
 	assert.ok(record, 'the stop alone is enough to write the record');
 	assert.equal(record.toolCallId, 'bg-1');
@@ -814,6 +916,8 @@ test('a background sub-agent logs on its stop, before any trailer is known', asy
 		'subagentType',
 		'tokensUsed',
 	]);
+	// An unauditable sub-agent withholds the cache cluster entirely.
+	assert.equal(subagentLine(fake), '  subagents 1k tok · 1 run');
 });
 
 test('the log setting suppresses per-sub-agent records too', async (t) => {
@@ -997,8 +1101,11 @@ test('one unauditable sub-agent withholds the figure for the whole line', (t) =>
 	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
 	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
-	// Measured, but with no trailer total: the figure cannot be taken for all of them.
+	// A background sub-agent's only `agent`-tool result is the launch ack — no trailer is ever
+	// observable — so its run is measured but unauditable, and the figure cannot be taken for
+	// all of them.
 	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
+	finishAgentCall(fake, 'call-2');
 	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
 
 	assert.equal(subagentLine(fake), '  subagents 1.5M tok · 2 runs');
@@ -1024,17 +1131,17 @@ test('a cache write only withholds the figure for the session it happened in', (
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 800), 100);
-	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
-	// A finalized entry is immutable, so the trailer must land before the stop that finalizes.
-	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	// Foreground: the trailer arrives when the `agent` tool call completes, after the stop.
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
 	assert.equal(subagentLine(fake), '  subagents 1M tok · 1 run');
 
 	fake.emit('session_start', {sessionId: 's2'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
-	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
-	finishAgentCallWithResult(fake, 'call-2', CACHED_TRAILER);
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-2', CACHED_TRAILER);
 
 	assert.equal(subagentLine(fake), '  subagents 1M tok  ⛁ ≥25% cached · 1 run');
 });
@@ -1045,13 +1152,14 @@ test('the figure sums the per-sub-agent gaps and clamps a shortfall to zero', (t
 
 	fake.emit('run_start', {sessionId: 's1'});
 	modelCall(fake, t, 'm', usage(100, 10, 90, 0), 100);
-	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', background: true});
-	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
+	// Both foreground: each trailer arrives when its `agent` tool call completes.
+	startSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-1', subagentType: 'explore', tokensUsed: 1_000_000});
+	finishAgentCallWithResult(fake, 'call-1', CACHED_TRAILER);
 	// A trailer total below the measured spend contributes nothing — never a negative.
-	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', background: true});
-	finishAgentCallWithResult(fake, 'call-2', '<usage>total_tokens: 400000</usage>');
+	startSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore'});
 	stopSubagent(fake, {toolCallId: 'call-2', subagentType: 'explore', tokensUsed: 500_000});
+	finishAgentCallWithResult(fake, 'call-2', '<usage>total_tokens: 400000</usage>');
 
 	// 250k cached of 1.5M spent.
 	assert.equal(subagentLine(fake), '  subagents 1.5M tok  ⛁ ≥17% cached · 2 runs');

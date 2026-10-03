@@ -169,6 +169,22 @@ function readUsage(raw: unknown): Usage {
 	};
 }
 
+// The hook's `result` is the tool's *content*, not a bare string: the harness builds tools
+// with `textResult({text})`, which returns `{ok: true, content: [{type: 'text', text}]}`, and
+// hands the `.content` array to `afterToolCall`. So the `agent` tool's result — the thing the
+// `<usage>` trailer lives in — arrives as an array of content blocks. Normalize either shape
+// down to its text; anything else has no trailer.
+function trailerText(result: unknown): string | undefined {
+	if (typeof result === 'string') return result; // tolerated, though the host never sends it
+	if (Array.isArray(result)) {
+		return result
+			.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+			.map((block) => block.text)
+			.join('\n');
+	}
+	return undefined;
+}
+
 // Parse the `<usage>` trailer the `agent` tool appends to its result text:
 //
 //   <usage>total_tokens: 1256306
@@ -176,11 +192,13 @@ function readUsage(raw: unknown): Usage {
 //   turns: 19
 //   duration_ms: 117189</usage>
 //
-// Tolerant by design: a non-string result, a missing block, or a key that is absent or not
-// a number leaves that field (or the whole trailer) undefined — never an exception.
+// Tolerant by design: a result with no text (a non-string, non-array value; an empty block
+// array), a missing block, or a key that is absent or not a number leaves that field (or the
+// whole trailer) undefined — never an exception.
 function parseSubagentTrailer(result: unknown): SubagentTrailer | undefined {
-	if (typeof result !== 'string') return undefined;
-	const block = result.match(/<usage>([\s\S]*?)<\/usage>/);
+	const text = trailerText(result);
+	if (text === undefined) return undefined;
+	const block = text.match(/<usage>([\s\S]*?)<\/usage>/);
 	if (block === null) return undefined;
 	const body = block[1];
 	const read = (key: string): number | undefined => {
